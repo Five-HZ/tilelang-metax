@@ -1,3 +1,62 @@
+The mcTileLang project is modified from tilelang (https://github.com/tile-ai/tilelang).
+Please see the LICENSE for the license for this project.
+
+This project contains third-party components with separate copyright
+notices and license terms. Your use of the source code for the these
+third-party components are subject to the terms and conditions of
+their licenses.
+
+The following files may have been Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. in 2025.
+Modification copyright 2025 MetaX Integrated Circuits (Shanghai) Co., Ltd.
+    modified: .gitmodules
+    modified: CMakeLists.txt
+    modified: README.md
+    modified: examples/blocksparse_attention/example_tilelang_block_sparse_attn.py
+    modified: examples/blocksparse_attention/example_tilelang_sparse_gqa_decode_varlen_indice.py
+    modified: examples/blocksparse_attention/example_tilelang_sparse_gqa_decode_varlen_mask.py
+    modified: examples/deepseek_mla/example_mla_decode.py
+    modified: examples/deepseek_mla/test_example_mla_decode.py
+    modified: examples/gemm/example_gemm_autotune.py
+    modified: examples/gemm/test_example_gemm.py
+    modified: examples/quickstart.py
+    modified: src/layout/gemm_layouts.cc
+    modified: src/layout/layout.h
+    modified: src/op/elem.cc
+    modified: src/op/gemm.cc
+    modified: src/op/logical.cc
+    modified: src/op/parallel.cc
+    modified: src/target/utils.cc
+    modified: src/target/utils.h
+    modified: tilelang/carver/arch/__init__.py
+    modified: tilelang/carver/matmul_analysis.py
+    modified: tilelang/carver/roller/hint.py
+    modified: tilelang/engine/__init__.py
+    modified: tilelang/engine/callback.py
+    modified: tilelang/engine/lower.py
+    modified: tilelang/engine/phase.py
+    modified: tilelang/jit/adapter/cython/adapter.py
+    modified: tilelang/jit/adapter/cython/cython_wrapper.pyx
+    modified: tilelang/jit/adapter/libgen.py
+    modified: tilelang/jit/adapter/utils.py
+    modified: tilelang/jit/adapter/wrapper.py
+    modified: tilelang/quantize/lop3.py
+    modified: tilelang/utils/target.py
+    modified: tilelang/utils/tensor.py
+
+The following files are newly added by MetaX Integrated Circuits (Shanghai) Co., Ltd. in 2025. All rights reserved.
+    added: src/target/codegen_maca.cc
+    added: src/target/codegen_maca.h
+    added: src/target/rt_mod_maca.cc
+    added: src/tl_templates/maca/common.h
+    added: src/tl_templates/maca/debug.h
+    added: src/tl_templates/maca/gemm.h
+    added: src/tl_templates/maca/maca_fp8.h
+    added: src/tl_templates/maca/reduce.h
+    added: src/tl_templates/maca/threadblock_swizzle.h
+    added: testing/python/conftest.py
+    added: tilelang/carver/arch/maca.py
+    added: tilelang/quantize/lop3_maca.py
+
 BitBLAS uses third-party material as listed below. The attached notices are 
 provided for informational purposes only. 
 

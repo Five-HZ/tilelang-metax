@@ -1,3 +1,5 @@
+// 2025 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
+
 /*!
  * \file tl/op/gemm.cc
  *
@@ -60,6 +62,7 @@ Gemm::Gemm(Array<PrimExpr> args, BufferMap vmap) {
 
 std::pair<int, int> Gemm::ComputeWarpPartition(int num_warps, Target target,
                                                bool maybe_hopper_wgmma) const {
+  ICHECK(num_warps > 0) << "At least 1 warps";
   int m_warp = 1, n_warp = 1;
   constexpr int kMPerWarp = 16; // Rows processed by a single warp
   constexpr int kNPerWarp = 8;  // Columns processed by a single warp
@@ -175,6 +178,9 @@ std::pair<int, int> Gemm::ComputeWarpPartition(int num_warps, Target target,
         this->M / kMPerWarp; // Each warp needs at least 16 elements in M
     int max_n_warps =
         this->N / kNPerWarp; // Each warp needs at least 8 elements in N
+    if (TargetIsMetaxC500(target)) {
+      max_n_warps = this->N / 16;
+    }
 
     // Calculate the ideal ratio of M/N warps based on the matrix dimensions
     float ideal_ratio = 1.0f;
@@ -217,7 +223,7 @@ std::pair<int, int> Gemm::ComputeWarpPartition(int num_warps, Target target,
 
 Stmt Gemm::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   int warp_size = 32;
-  if (TargetIsCDNA(T.target)) {
+  if (TargetIsCDNA(T.target) || TargetIsMetaxC500(T.target)) {
     warp_size = 64;
   }
   auto block_size = *as_const_int(T.thread_bounds->extent);
@@ -239,7 +245,7 @@ Stmt Gemm::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   ss << warp_m << ", " << warp_n << ", ";
   ss << trans_A << ", " << trans_B;
   ss << ", " << clear_accum;
-  if (TargetIsCDNA(T.target)) {
+  if (TargetIsCDNA(T.target) || TargetIsMetaxC500(T.target)) {
     // for cdna gemm, we need to specify kPack
     ss << ", " << kPack;
   } else if (TargetIsHopper(T.target)) {
@@ -396,6 +402,43 @@ LayoutMap Gemm::InferLayout(const LayoutInferArgs &T, InferLevel level) {
           *as_const_int(B->shape[dim_B - 1]), B->dtype.bits(), kPack);
 
       results.Set(B, shared_layout);
+    } else if (B.scope() == "local.fragment") {
+      auto fragment =
+          makeGemmFragmentB(M, N, K, M / warp_m, N / warp_n, trans_B);
+      results.Set(B, fragment->BindThreadRange(thread_range));
+    } else {
+      ICHECK(0);
+    }
+  } else if (TargetIsMetaxC500(T.target)) {
+    // TODO: use XCORE1100 or C500 ?
+    const int warp_size = 64;
+    auto [warp_m, warp_n] =
+        ComputeWarpPartition(block_size / warp_size, T.target);
+    auto fragment =
+        makeGemmFragmentCMACA(M, N, M / warp_m, N / warp_n, C->dtype.bits());
+    results.Set(C, fragment->BindThreadRange(thread_range));
+
+    if (A.scope() == "shared" || A.scope() == "shared.dyn") {
+      int dim_A = A->shape.size();
+      const int64_t mat_stride = *as_const_int(A->shape[dim_A - 2]);
+      const int64_t mat_continuous = *as_const_int(A->shape[dim_A - 1]);
+      results.Set(A,
+                  makeGemmABLayoutMACA(mat_stride, mat_continuous, mat_continuous,
+                                       A->dtype.bits(), trans_A ? 1 : 2));
+    } else if (A.scope() == "local.fragment") {
+      auto fragment = makeGemmFragmentAMACA(M, N, K, M / warp_m, N / warp_n,
+                                            A->dtype.bits(), trans_A);
+      results.Set(A, fragment->BindThreadRange(thread_range));
+    } else {
+      ICHECK(0);
+    }
+    if (B.scope() == "shared" || B.scope() == "shared.dyn") {
+      int dim_B = B->shape.size();
+      const int64_t mat_stride = *as_const_int(B->shape[dim_B - 2]);
+      const int64_t mat_continuous = *as_const_int(B->shape[dim_B - 1]);
+      results.Set(B,
+                  makeGemmABLayoutMACA(mat_stride, mat_continuous, mat_continuous,
+                                       B->dtype.bits(), trans_B ? 2 : 1));
     } else if (B.scope() == "local.fragment") {
       auto fragment =
           makeGemmFragmentB(M, N, K, M / warp_m, N / warp_n, trans_B);

@@ -22,7 +22,7 @@ Tile Language (**tile-lang**) is a concise domain-specific language designed to 
 - 01/20/2025 ✨: We are excited to announce that tile-lang, a dsl for high performance AI workloads, is now open source and available to the public!
 
 ## Tested Devices
-Although tile-lang aims to be portable across a range of Devices, it has been specifically tested and validated on the following devices: for NVIDIA GPUs, this includes the H100 (with Auto TMA/WGMMA support), A100, V100, RTX 4090, RTX 3090, and RTX A6000; for AMD GPUs, it includes the MI250 (with Auto MatrixCore support) and the MI300X (with Async Copy support).
+Although tile-lang aims to be portable across a range of Devices, it has been specifically tested and validated on the following devices: for MetaX GPUs, it includes the C500; for NVIDIA GPUs, this includes the H100 (with Auto TMA/WGMMA support), A100, V100, RTX 4090, RTX 3090, and RTX A6000; for AMD GPUs, it includes the MI250 (with Auto MatrixCore support) and the MI300X (with Async Copy support).
 
 ## OP Implementation Examples
 **tile-lang** provides the building blocks to implement a wide variety of operators. Some examples include:
@@ -36,80 +36,18 @@ Although tile-lang aims to be portable across a range of Devices, it has been sp
 
 Within the `examples` directory, you will also find additional complex kernels—such as convolutions, forward/backward passes for FlashAttention, more operators will continuously be added.
 
-
-## Benchmark Summary
-
-TileLang achieves exceptional performance across a variety of computational patterns. Comprehensive benchmark scripts and settings are available at [tilelang-benchmark](https://github.com/tile-ai/tilelang-benchmark). Below are selected results showcasing its capabilities:
-
-- MLA Decoding Performance on H100
-
-  <div style="display: flex; gap: 10px; justify-content: center;">
-    <div style="flex: 1;">
-      <img src="./examples/deepseek_mla/figures/bs64_float16.png" alt="mla decode performance bs64 on H100" width="100%" />
-    </div>
-    <div style="flex: 1;">
-      <img src="./examples/deepseek_mla/figures/bs128_float16.png" alt="mla decode performance bs128 on H100" width="100%" />
-    </div>
-  </div>
-  
-- Flash Attention Performance on H100
-
-  <div align="center">    <img src="./images/mha_performance_h100.png" alt="operator performance on H100" width=80% />
-  </div>
-
-- Matmul Performance on GPUs (RTX 4090, A100, H100, MI300X)
-
-  <div>
-    <img src="./images/op_benchmark_consistent_gemm_fp16.png" alt="gemm fp16 performance on Gpus" />
-  </div>
-
-- Dequantize Matmul Performance on A100
-
-  <div>
-    <img src="./images/op_benchmark_a100_wq_gemv.png" alt="dequantize gemv performance on A100" />
-  </div>
-
 ## Installation
-### Method 1: Install with Pip
 
-The quickest way to get started is to install the latest release from PyPI:
+### Prepare MACA SDK
 
-```bash
-pip install tilelang
-```
+Check out 《曦云系列_通用计算GPU_快速上手指南》 from [Metax developer community](https://developer.metax-tech.com)
 
-Alternatively, you can install directly from the GitHub repository:
-
-```bash
-pip install git+https://github.com/tile-ai/tilelang
-```
-
-Or install locally:
-
-```bash
-# install required system dependencies
-sudo apt-get update
-sudo apt-get install -y python3-setuptools gcc libtinfo-dev zlib1g-dev build-essential cmake libedit-dev libxml2-dev
-
-pip install -e . -v # remove -e option if you don't want to install in editable mode, -v for verbose output
-```
-
-### Method 2: Build from Source
+### Build from Source
 We currently provide three ways to install **tile-lang** from source:
  - [Install from Source (using your own TVM installation)](./docs/get_started/Installation.md#method-1-install-from-source-using-your-own-tvm-installation)
  - [Install from Source (using the bundled TVM submodule)](./docs/get_started/Installation.md#method-2-install-from-source-using-the-bundled-tvm-submodule)
  - [Install Using the Provided Script](./docs/get_started/Installation.md#method-3-install-using-the-provided-script)
 
-### Method 3: Install with Nightly Version
-
-For users who want access to the latest features and improvements before official releases, we provide nightly builds of **tile-lang**.
-
-```bash
-pip install tilelang -f https://tile-ai.github.io/whl/nightly/cu121/
-# or pip install tilelang --find-links https://tile-ai.github.io/whl/nightly/cu121/
-```
-
-> **Note:** Nightly builds contain the most recent code changes but may be less stable than official releases. They're ideal for testing new features or if you need a specific bugfix that hasn't been released yet.
 
 ## Quick Start
 
@@ -184,7 +122,7 @@ func = matmul(1024, 1024, 1024, 128, 128, 32)
 # out_idx specifies the index of the output buffer in the argument list
 # if out_idx is specified, the tensor will be created during runtime
 # target currently can be "cuda" or "hip" or "cpu".
-jit_kernel = tilelang.compile(func, out_idx=[2], target="cuda")
+jit_kernel = tilelang.compile(func, out_idx=[2], target="maca")
 
 # 3. Test the kernel in Python with PyTorch data
 import torch

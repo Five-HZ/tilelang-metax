@@ -1,3 +1,5 @@
+# 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
 import argparse
 import torch
 import itertools
@@ -5,7 +7,7 @@ import tilelang as tl
 import tilelang.language as T
 from tilelang.autotuner import AutoTuner
 from tilelang.carver.template import MatmulTemplate
-from tilelang.carver.arch import CUDA
+from tilelang.carver.arch import MACA
 from tilelang.carver.roller.rasterization import NoRasterization
 
 
@@ -15,7 +17,7 @@ def ref_program(A, B):
 
 def get_configs(M, N, K, with_roller=False, topk=20):
     if with_roller:
-        arch = CUDA("cuda")
+        arch = MACA("maca")
         carve_template = MatmulTemplate(
             M=M,
             N=N,
@@ -243,7 +245,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--with_roller",
         action="store_true",
-        default=True,
+        default=False,
         help="Whether to enable BitBLAS roller for search space")
     args = parser.parse_args()
     main(args.m, args.n, args.k, args.use_autotune, args.with_roller)

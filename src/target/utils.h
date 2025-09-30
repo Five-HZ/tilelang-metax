@@ -1,3 +1,5 @@
+// 2025 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
+
 /*!
  * \file tl/target/utils.h
  * \brief helper functions for target attributes.
@@ -14,12 +16,14 @@ namespace tl {
 
 bool TargetIsCuda(Target target);
 bool TargetIsRocm(Target target);
+bool TargetIsMaca(Target target);
 
 bool TargetIsVolta(Target target);
 bool TargetIsTuring(Target target);
 bool TargetIsAmpere(Target target);
 bool TargetIsHopper(Target target);
 bool TargetIsCDNA(Target target);
+bool TargetIsMetaxC500(Target target);
 
 bool TargetHasAsyncCopy(Target target);
 bool TargetHasLdmatrix(Target target);

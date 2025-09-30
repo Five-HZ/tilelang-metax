@@ -1,3 +1,5 @@
+# 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
 import tilelang
 import tilelang.language as T
 # `make_mma_swizzle_layout` is a python defined layout function
@@ -19,7 +21,7 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="flo
             C: T.Tensor((M, N), dtype),
     ):
         # Initialize Kernel Context
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=256) as (bx, by):
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
@@ -71,7 +73,7 @@ func = matmul(M, N, K, block_M, block_N, block_K)
 # out_idx specifies the index of the output buffer in the argument list
 # if out_idx is specified, the tensor will be created during runtime
 # target currently can be "cuda" or "hip" or "cpu".
-jit_kernel = tilelang.compile(func, out_idx=[2], target="cuda", execution_backend="cython")
+jit_kernel = tilelang.compile(func, out_idx=[2], target="maca", execution_backend="cython")
 # jit_kernel = tilelang.compile(func, out_idx=[2], target="cuda", execution_backend="dlpack")
 
 # 3. Test the kernel in Python with PyTorch data

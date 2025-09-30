@@ -1,3 +1,5 @@
+# 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
 """The profiler and convert to torch utils"""
 
 from ..base import BaseKernelAdapter
@@ -10,7 +12,7 @@ from tvm import tir
 from tvm.relay import TensorType
 from tilelang.jit.adapter.wrapper import TLWrapper
 from tilelang.jit.adapter.libgen import LibraryGenerator
-from tilelang.jit.adapter.utils import is_cuda_target, is_hip_target, is_cpu_target
+from tilelang.jit.adapter.utils import is_cuda_target, is_hip_target, is_cpu_target, is_maca_target
 from tilelang.utils.target import determine_target
 from tilelang.utils.language import retrieve_func_from_module
 from tilelang.utils.tensor import map_torch_type
@@ -151,7 +153,7 @@ with open(cython_wrapper_path, "r") as f:
                     os.system(f"{cython} {cython_wrapper_path} --cplus -o {source_path}")
                     python_include_path = sysconfig.get_path("include")
                     cc = get_cplus_compiler()
-                    command = f"{cc} -shared -pthread -fPIC -fwrapv -O2 -Wall -fno-strict-aliasing -I{python_include_path} {source_path} -o {temp_path}"
+                    command = f"{cc} -shared -pthread -fPIC -fwrapv -O2 -Wall -fno-strict-aliasing -I/usr/include -I{python_include_path} {source_path} -o {temp_path}"
                     os.system(command)
 
                     # rename the temp file to the library file
@@ -402,7 +404,7 @@ class CythonKernelAdapter(BaseKernelAdapter):
         buffer_map = func.buffer_map
         buffer_device_map = {}
         device = None
-        if is_cuda_target(self.target) or is_hip_target(self.target):
+        if is_cuda_target(self.target) or is_hip_target(self.target) or is_maca_target(self.target):
             device = torch.device("cuda")
         elif is_cpu_target(self.target):
             device = torch.device("cpu")

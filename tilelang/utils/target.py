@@ -1,7 +1,10 @@
+# 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
 from typing import Literal, Union
 from tilelang import tvm as tvm
 from tvm.target import Target
 from tvm.contrib import rocm
+from tvm.contrib import mxcc
 from tilelang.contrib import nvcc
 
 AVALIABLE_TARGETS = {
@@ -11,6 +14,7 @@ AVALIABLE_TARGETS = {
     "webgpu",
     "c",  # represent c source backend
     "llvm",
+    "maca"
 }
 
 
@@ -39,6 +43,17 @@ def check_hip_availability() -> bool:
     except Exception:
         return False
 
+def check_maca_availability() -> bool:
+    """
+    Check if MACA is available on the system by locating the MACA path.
+    Returns:
+        bool: True if MACA is available, False otherwise.
+    """
+    try:
+        mxcc.find_maca_path()
+        return True
+    except Exception:
+        return False
 
 def determine_target(target: Union[str, Target, Literal["auto"]] = "auto",
                      return_object: bool = False) -> Union[str, Target]:
@@ -64,9 +79,12 @@ def determine_target(target: Union[str, Target, Literal["auto"]] = "auto",
         # Check for CUDA and HIP availability
         is_cuda_available = check_cuda_availability()
         is_hip_available = check_hip_availability()
+        is_maca_available = check_maca_availability()
 
         # Determine the target based on availability
-        if is_cuda_available:
+        if is_maca_available:
+            return_var = "maca"
+        elif is_cuda_available:
             return_var = "cuda"
         elif is_hip_available:
             return_var = "hip"

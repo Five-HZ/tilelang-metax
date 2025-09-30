@@ -1,6 +1,10 @@
+# 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
-from typing import Dict, Literal
+from typing import Dict, Literal, Union
+from tvm.target import Target
+from tilelang.utils.target import AVALIABLE_TARGETS, determine_target
 
 decode_i4_to_f16 = """
 template <typename T1, typename T2, bool isSigned = false>
@@ -1096,6 +1100,7 @@ def get_lop3_intrin_group(
     with_zeros: bool = False,
     zeros_mode: Literal["original", "rescale", "quantized"] = "original",
     storage_scope: str = "local",
+    target: Union[str, Target] = "auto",
 ) -> Dict[str, str]:
     """
     This function is used to get the intrinsic group of the LOP3 operation to avoid the overhead of fast decoding.
@@ -1195,6 +1200,14 @@ def get_lop3_intrin_group(
         func_name += f"_zeros_{zeros_mode}"
     if is_ladder_stage3:
         func_name += "_offset"
+
+    if isinstance(target, str):
+        assert target in AVALIABLE_TARGETS, f"Invalid target: {target}"
+        target = determine_target(target)
+    target = Target(target)
+    if target.kind.name == "maca":
+        from .lop3_maca import import_maca_c_map
+        import_c_map = import_maca_c_map
 
     return {
         "func_name": func_name,

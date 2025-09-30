@@ -1,3 +1,5 @@
+# 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
 """Hint definition for schedule"""
 from tvm import DataType
 from typing import Dict, List, Tuple
@@ -103,6 +105,11 @@ class TileDict:
     def __hash__(self) -> int:
         return hash(tuple(self.output_tile))
 
+    def __str__(self) -> str:
+        return f"TileDict(output_tile: {self.output_tile})"
+
+    def __repr__(self) -> str:
+        return str(self)
 
 class IntrinInfo:
     """

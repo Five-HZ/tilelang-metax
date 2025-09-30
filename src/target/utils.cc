@@ -1,3 +1,5 @@
+// 2025 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
+
 /*!
  * \file tl/target/utils.cc
  * \brief helper functions for target attributes.
@@ -14,7 +16,9 @@ bool TargetIsCuda(Target target) {
 bool TargetIsRocm(Target target) {
   return target->GetTargetDeviceType() == kDLROCM;
 }
-
+bool TargetIsMaca(Target target) {
+  return target->GetTargetDeviceType() == kDLMACA;
+}
 int GetArchInt(Target target) {
   auto s = target->GetAttr<String>("arch");
   ICHECK(s.defined());
@@ -60,6 +64,17 @@ bool TargetIsCDNA(Target target) {
     std::string mcpu = Downcast<String>(target->attrs.at("mcpu"));
     // if mcpu start with "gfx9", it is CDNA
     return mcpu.find("gfx9") == 0;
+  }
+  return false;
+}
+
+bool TargetIsMetaxC500(Target target) {
+  if (!TargetIsMaca(target))
+    return false;
+  if (target->attrs.count("mcpu")) {
+    std::string mcpu = Downcast<String>(target->attrs.at("mcpu"));
+    // if mcpu start with "xcore", it is Metax GPU
+    return mcpu.find("XCORE1000") == 0;
   }
   return false;
 }

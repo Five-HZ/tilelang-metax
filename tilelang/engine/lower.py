@@ -1,3 +1,5 @@
+# 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
 """The compiler for TL programs."""
 
 import os
@@ -184,6 +186,9 @@ def device_codegen_without_compile(device_mod: tvm.IRModule, target: Target) -> 
         device_mod = tvm._ffi.get_global_func("target.build.llvm")(device_mod, target)
     elif target.kind.name == "webgpu":
         device_mod = tvm._ffi.get_global_func("target.build.tilelang_webgpu")(device_mod, target)
+    elif target.kind.name == "maca":
+        device_mod = tvm._ffi.get_global_func("target.build.tilelang_maca_without_compile")(
+            device_mod, target)
     else:
         raise ValueError(f"Target {target.kind.name} is not supported")
 

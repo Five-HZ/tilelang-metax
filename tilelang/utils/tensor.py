@@ -1,3 +1,5 @@
+# 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
 from __future__ import annotations
 """The profiler and convert to torch utils"""
 from enum import Enum
@@ -29,6 +31,27 @@ def map_torch_type(intype: str) -> torch.dtype:
     else:
         return getattr(torch, intype)
 
+
+def map_torch2tvm_type(intype: torch.dtype) -> str:
+    typemap = {
+        torch.float8_e4m3fn: "e4m3_float8",
+        torch.float8_e4m3fnuz: "e4m3_float8",
+        torch.float8_e5m2: "e5m2_float8",
+        torch.float8_e5m2fnuz: "e5m2_float8",
+        torch.float32: "float32",
+        torch.float64: "float64",
+        torch.float16: "float16",
+        torch.int8: "int8",
+        torch.uint8: "uint8",
+        torch.int16: "int16",
+        torch.int32: "int32",
+        torch.int64: "int64",
+        torch.bool: "bool",
+    }
+    if intype in typemap:
+        return typemap[intype]
+    else:
+        raise ValueError(f"Unsupported PyTorch data type: {dtype}")
 
 def adapt_torch2tvm(arg):
     float8_dtype_map = {

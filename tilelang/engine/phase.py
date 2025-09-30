@@ -1,3 +1,5 @@
+# 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
 from tvm import tir, IRModule
 from tvm.target import Target
 import tilelang
@@ -100,6 +102,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.InjectFenceProxy()(mod)
     else:
         mod = tilelang.transform.IfStmtBinding()(mod)
+        mod = tilelang.transform.MergeIfStmt()(mod)
         mod = tir.transform.PlanAndUpdateBufferAllocationLocation()(mod)
         mod = tilelang.transform.PipelinePlanning()(mod)
         mod = tilelang.transform.InjectSoftwarePipeline()(mod)

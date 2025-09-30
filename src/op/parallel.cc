@@ -1,3 +1,5 @@
+// 2025 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
+
 /*!
  * \file op/parallel.cc
  * \brief Define Parallel for operator
@@ -258,7 +260,7 @@ LayoutMap ParallelOp::InferLayout(const LayoutInferArgs &T, InferLevel level) {
                               T.thread_bounds));
     }
 
-    // Layout infer conflict for local.fragment can noy be handled here
+    // Layout infer conflict for local.fragment can not be handled here
     // because the source_buffer is not always available
     if (buffer.scope() == "local.fragment" && source_buffer.defined() &&
         source_buffer.scope() == "local.fragment") {

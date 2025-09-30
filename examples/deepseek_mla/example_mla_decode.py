@@ -1,3 +1,5 @@
+# 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
 import torch
 import torch.nn.functional as F
 import tilelang
@@ -51,18 +53,18 @@ def flashattn(batch, heads, kv_head_num, seqlen_kv, dim, pe_dim, block_N, block_
             T.fill(scores_max, -T.infinity(accum_dtype))
 
             loop_range = T.ceildiv(seqlen_kv, block_N)
-            for k in T.Pipelined(loop_range, num_stages=2):
+            for k in T.serial(loop_range):
                 T.copy(KV[bx, k * block_N:(k + 1) * block_N, cur_kv_head, :], KV_shared)
                 T.copy(K_pe[bx, k * block_N:(k + 1) * block_N, cur_kv_head, :], K_pe_shared)
                 T.clear(acc_s)
                 T.gemm(
-                    Q_shared, KV_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
+                    Q_shared, KV_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
                 T.gemm(
                     Q_pe_shared,
                     K_pe_shared,
                     acc_s,
                     transpose_B=True,
-                    policy=T.GemmWarpPolicy.FullCol)
+                    policy=T.GemmWarpPolicy.FullRow)
                 T.copy(scores_max, scores_max_prev)
                 T.fill(scores_max, -T.infinity(accum_dtype))
                 T.reduce_max(acc_s, scores_max, dim=1, clear=False)
@@ -76,7 +78,7 @@ def flashattn(batch, heads, kv_head_num, seqlen_kv, dim, pe_dim, block_N, block_
                     logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
                 for i, j in T.Parallel(block_H, dim):
                     acc_o[i, j] *= scores_scale[i]
-                T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullCol)
+                T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
             for i, j in T.Parallel(block_H, dim):
                 acc_o[i, j] /= logsum[i]
             T.copy(acc_o, O_shared)
@@ -276,7 +278,7 @@ def main():
     parser.add_argument('--heads', type=int, default=128, help='q heads number')
     parser.add_argument('--kv_heads', type=int, default=1, help='kv heads number')
     parser.add_argument('--kv_ctx', type=int, default=8192, help='kv context length')
-    parser.add_argument('--dim', type=int, default=512, help='head dim')
+    parser.add_argument('--dim', type=int, default=64, help='head dim')
     parser.add_argument('--pe_dim', type=int, default=64, help='pe head dim')
     args = parser.parse_args()
     batch, heads, kv_heads, kv_ctx, dim, pe_dim = args.batch, args.heads, args.kv_heads, args.kv_ctx, args.dim, args.pe_dim
@@ -291,7 +293,8 @@ def main():
     kernel = tilelang.compile(program, out_idx=[6])
     profiler = kernel.get_profiler(tensor_supply_type=tilelang.TensorSupplyType.Randn)
     profiler.assert_allclose(ref_program, rtol=0.01, atol=0.01)
-    latency = profiler.do_bench(warmup=500)
+    latency = profiler.do_bench(n_warmup=0, n_repeat=0)
+    # print(kernel.get_kernel_source())
     print(f"Latency: {latency} ms")
     print(f"TFlops: {total_flops / latency * 1e-9} TFlops")
 

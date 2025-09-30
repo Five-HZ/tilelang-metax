@@ -133,6 +133,16 @@ if(USE_ROCM)
   list(APPEND TILE_LANG_SRCS ${TILE_LANG_HIP_SRCS})
 endif()
 
+# Include MACA source files if MACA is enabled
+if(USE_MACA)
+  include_directories(SYSTEM $ENV{MACA_PATH}/include)
+  tilelang_file_glob(GLOB TILE_LANG_MACA_SRCS
+    src/target/codegen_maca.cc
+    src/target/rt_mod_maca.cc
+  )
+  list(APPEND TILE_LANG_SRCS ${TILE_LANG_MACA_SRCS})
+endif()
+
 message(STATUS "Collected source files: ${TILE_LANG_SRCS}")
 
 # Add TileLang object library

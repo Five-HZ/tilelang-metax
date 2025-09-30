@@ -1,3 +1,5 @@
+# 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
 # cython: language_level=3
 
 import torch
@@ -5,8 +7,9 @@ cimport cython
 import ctypes
 from libc.stdint cimport int64_t, uintptr_t
 from libc.stdlib cimport malloc, free
+import tvm
 from tvm import tir
-from tilelang.utils.tensor import map_torch_type
+from tilelang.utils.tensor import map_torch_type, map_torch2tvm_type
 
 cdef class CythonKernelWrapper:
     # Class attributes to store kernel configuration and library reference
@@ -129,7 +132,10 @@ cdef class CythonKernelWrapper:
                     else:  # Already converted to Python int during initialization
                         shape.append(s)
                 device = inputs[0].device if len(inputs) > 0 else torch.cuda.current_device()
-                tensor = torch.empty(*shape, dtype=dtype, device=device)
+                if isinstance(inputs[0], tvm.runtime.ndarray.NDArray):
+                    tensor = tvm.nd.empty((*shape,), dtype=map_torch2tvm_type(dtype), device=device)
+                else:
+                    tensor = torch.empty(*shape, dtype=dtype, device=device)
             else:
                 tensor = inputs[ins_idx]
                 ins_idx += 1
@@ -153,6 +159,8 @@ cdef class CythonKernelWrapper:
                 call_args.append(ctypes.c_float(tensor))
             elif isinstance(tensor, bool):
                 call_args.append(ctypes.c_bool(tensor))
+            elif isinstance(tensor, tvm.nd.NDArray):
+                call_args.append(ctypes.cast(tensor.handle.contents.data, ctypes.c_void_p))
             else:
                 raise ValueError(f"Unsupported tensor type: {type(tensor)}")
 

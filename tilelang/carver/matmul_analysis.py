@@ -1,3 +1,4 @@
+# 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 # pylint: disable=missing-docstring, invalid-name
 """A GEMM schedule rule for GPU operators."""
 from dataclasses import dataclass
@@ -561,7 +562,7 @@ def get_tensorized_func_and_tags(
 
         # Nvidia Only Support Tensor Core for
         # devices greater than 70.
-        if check_sm_version(target.arch) < 70:
+        if check_sm_version(target.arch) < 70 and target.kind.name != "maca":
             return False
         # analysis tensorcore axis
         # todo(lei): maybe we can remove this in the future
@@ -679,6 +680,15 @@ def get_tensorized_func_and_tags(
 
             if (isinstance(extent, tir.expr.IntImm) and extent.value < minimal_tensorize_threshold):
                 return func, None
+        tags = analysis_tensorcore_tags(sch, main_block, target)
+        return sch.mod["main"], tags
+    elif  target.kind.name == "maca":
+        if not skip_normalize:
+            sch = normalize_to_matmul(sch, main_block, layout)
+            if sch is None:
+                return func, None
+
+        block_stmt = sch.get(main_block)
         tags = analysis_tensorcore_tags(sch, main_block, target)
         return sch.mod["main"], tags
 

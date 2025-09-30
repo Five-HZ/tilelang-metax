@@ -1,3 +1,5 @@
+# 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
 import ctypes
 import importlib
 import logging
@@ -8,13 +10,14 @@ import tempfile
 from typing import Optional
 
 from tvm.target import Target
+from tvm.contrib.mxcc import get_maca_arch, find_maca_path
 
 from tilelang import tvm as tvm
 from tilelang.contrib.nvcc import get_nvcc_compiler, get_target_compute_version
 from tilelang.contrib.rocm import find_rocm_path, get_rocm_arch
 from tilelang.env import TILELANG_TEMPLATE_PATH
 
-from .utils import is_cpu_target, is_cuda_target, is_hip_target
+from .utils import is_cpu_target, is_cuda_target, is_hip_target, is_maca_target
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +106,30 @@ class LibraryGenerator(object):
             command = [get_cplus_compiler(), "-std=c++17", "-fPIC", "-shared", src.name]
             command += [
                 "-I" + TILELANG_TEMPLATE_PATH,
+            ]
+        elif is_maca_target(target):
+            from tilelang.env import COMPOSABLE_KERNEL_INCLUDE_DIR
+            src = tempfile.NamedTemporaryFile(mode="w", suffix=".cpp", delete=False)
+            libpath = src.name.replace(".cpp", ".so")
+            maca_path = find_maca_path()
+            arch = get_maca_arch(maca_path).lower()
+            command = [
+                "mxcc",
+                "-x",
+                "maca",
+                "-Wno-error=address-of-temporary",
+                "-std=c++17",
+                "-fPIC",
+                "-D__FAST_HALF_CVT__",
+                f"--offload-arch={arch}",
+                "--shared",
+                src.name,
+            ]
+            command += [
+                "-I" + COMPOSABLE_KERNEL_INCLUDE_DIR,
+            ]
+            command += [
+                "-I" + maca_path + "/include",
             ]
         else:
             raise ValueError(f"Unsupported target: {target}")

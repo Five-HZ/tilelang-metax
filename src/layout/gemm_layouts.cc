@@ -1,3 +1,5 @@
+// 2025 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
+
 /*!
  * \file layout/gemm_layouts.cc
  * \brief Define Layout used in MMA and other operations.
@@ -55,6 +57,15 @@ Fragment makeGemmFragmentC16x16CDNA() {
   IterVar rep = make_itervar("rep", 1);
   PrimExpr forward_thread = 16 * FloorDiv(j->var, 4) + i;
   PrimExpr index = FloorMod(j->var, 4);
+  return Fragment({i, j}, {index}, forward_thread, rep);
+}
+
+Fragment makeGemmFragmentC16x16F64XCORE() {
+  IterVar i = make_itervar("i", 16);
+  IterVar j = make_itervar("j", 16);
+  IterVar rep = make_itervar("rep", 1);
+  PrimExpr forward_thread = 16 * FloorMod(j->var, 4) + i;
+  PrimExpr index = FloorDiv(j->var, 4);
   return Fragment({i, j}, {index}, forward_thread, rep);
 }
 
@@ -121,6 +132,28 @@ Fragment makeGemmFragmentCCDNA(const int block_m, const int block_n,
       base_layout->Repeat({warp_m / 16, warp_n / 16}, false, true);
   auto block_layout =
       warp_layout->Repeat({block_m / warp_m, block_n / warp_n}, true, false);
+  return block_layout;
+}
+
+Fragment makeGemmFragmentCMACA(const int block_m, const int block_n,
+                               const int warp_m, const int warp_n,
+                               const int element_size) {
+  if (element_size == 64)
+    LOG(FATAL) << "Not supported";
+  ICHECK(block_m % warp_m == 0);
+  ICHECK(block_n % warp_n == 0);
+  ICHECK(warp_m % 16 == 0) << "warp_m=" << warp_m;
+  ICHECK(warp_n % 16 == 0) << "warp_n=" << warp_n;
+  IterVar i = make_itervar("i", 16);
+  IterVar j = make_itervar("j", 16);
+  IterVar rep = make_itervar("rep", 1);
+  PrimExpr forward_thread = 16 * FloorDiv(j->var, 4) + i;
+  PrimExpr index = FloorMod(j->var, 4);
+  auto base_layout = Fragment({i, j}, {index}, forward_thread, rep);
+  auto warp_layout =
+      base_layout->Repeat({block_m / warp_m, block_n / warp_n}, true, false);
+  auto block_layout =
+      warp_layout->Repeat({warp_m / 16, warp_n / 16}, false, false);
   return block_layout;
 }
 
@@ -234,6 +267,43 @@ Fragment makeGemmFragmentACDNA(const int block_m, const int block_n,
   }
 }
 
+Fragment makeGemmFragmentAMACA(const int block_m, const int block_n,
+                               const int block_k, const int warp_m,
+                               const int warp_n, const int element_size,
+                               bool transposed) {
+  // assume not transposed
+  ICHECK(block_m % warp_m == 0);
+  ICHECK(block_n % warp_n == 0);
+  ICHECK(warp_m % 16 == 0);
+  ICHECK(block_k % 16 == 0);
+  // Only support 8-bit and 16-bit
+  ICHECK(element_size == 8 || element_size == 16)
+      << "element bitwidth=" << element_size;
+
+  IterVar i = make_itervar("i", 16);
+  IterVar j = make_itervar("j", 16);
+  IterVar rep = make_itervar("rep", 1);
+  if (transposed) {
+    PrimExpr forward_thread = 16 * FloorDiv(i->var, 4) + j;
+    PrimExpr index = FloorMod(i->var, 4);
+    auto base_layout = Fragment({i, j}, {index}, forward_thread, rep)->Repeat({1, 1}, false, false);
+    auto warp_layout = base_layout->Repeat({1, block_m / warp_m}, true, false)
+                           ->Replicate(block_n / warp_n);
+    auto block_layout =
+        warp_layout->Repeat({block_k / 16, warp_m / 16}, false, true);
+    return block_layout;
+  } else {
+    PrimExpr forward_thread = 16 * FloorDiv(j->var, 4) + i;
+    PrimExpr index = FloorMod(j->var, 4);
+    auto base_layout = Fragment({i, j}, {index}, forward_thread, rep)->Repeat({1, 1}, false, false);
+    auto warp_layout = base_layout->Repeat({block_m / warp_m, 1}, true)
+                           ->Replicate(block_n / warp_n);
+    auto block_layout =
+        warp_layout->Repeat({warp_m / 16, block_k / 16}, false, false);
+    return block_layout;
+  }
+}
+
 Fragment makeGemmFragment32x32(int element_size) {
   IterVar i = make_itervar("i", 32);
   IterVar j = make_itervar("j", 32);
@@ -313,6 +383,14 @@ PrimExpr xor8x8(const PrimExpr &i, const PrimExpr j) {
   PrimExpr i1 = FloorDiv(i, 2);
   PrimExpr j1 = FloorDiv(j, 2);
   return 2 * xor4x4(i1, j1) + xor2x2(i0, j0);
+}
+
+PrimExpr xor16x16(const PrimExpr &i, const PrimExpr j) {
+  PrimExpr i0 = FloorMod(i, 2);
+  PrimExpr j0 = FloorMod(j, 2);
+  PrimExpr i1 = FloorDiv(i, 2);
+  PrimExpr j1 = FloorDiv(j, 2);
+  return 2 * xor8x8(i1, j1) + xor2x2(i0, j0);
 }
 
 // Layout swizzling for 32 bytes
@@ -604,6 +682,41 @@ Layout makeGemmABLayoutCDNA(int stride, int continuous, int element_size,
     return makeMatrixCoreSwizzleLayout(stride, continuous, element_size, kPack);
   else {
     return makeGemmABLayoutPadded(stride, continuous, element_size);
+  }
+}
+
+Layout makeGemmABLayoutMACA(int mat_stride, int mat_continuous, int continuity,
+                            int element_size, int kfactor) {
+  if (element_size == 64) {
+    if (kfactor == 1 && continuity % 16 == 0) // float64 KxN
+      return makeGemmABLayoutF64_Kouter(mat_stride, mat_continuous);
+    if (kfactor == 2 && continuity % 16 == 0) // float64 NxK
+      return makeGemmABLayoutF64_Kinner(mat_stride, mat_continuous);
+    return makeGemmABLayoutPadded(mat_stride, mat_continuous, element_size);
+  }
+  int vector_size = 128 / element_size;
+  if (kfactor == 1 && element_size == 8) {
+    return makeGemmABLayoutPadded(mat_stride, mat_continuous, element_size);
+  } else if (mat_continuous % (vector_size * 8) == 0) {
+    if (mat_stride % 64 == 32) {
+      return makeFullBankSwizzleLayout(mat_stride, mat_continuous, element_size);
+    }
+    Var i = InputPlaceholder(0);
+    Var j = InputPlaceholder(1);
+    int vector_size = 4;
+    PrimExpr ts = FloorDiv(i, 16);
+    PrimExpr s = FloorMod(i, 16);
+    PrimExpr tc = FloorDiv(FloorDiv(j, vector_size), 16);
+    PrimExpr c = FloorMod(FloorDiv(j, vector_size), 16);
+    PrimExpr vec = FloorMod(j, vector_size);
+    PrimExpr c_swizzle = xor16x16(c, s);
+    PrimExpr index = vec + (c_swizzle + s * 16) * vector_size;
+    return Layout(Array<PrimExpr>{mat_stride, mat_continuous}, {tc, ts, index});
+  } else if (mat_continuous % (vector_size * 4) == 0) {
+    return makeHalfBankSwizzleLayout(mat_stride, mat_continuous, element_size);
+  } else {
+    ICHECK(0);
+    return makeGemmABLayoutPadded(mat_stride, mat_continuous, element_size);
   }
 }
 } // namespace tl

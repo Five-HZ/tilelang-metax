@@ -1,3 +1,5 @@
+# 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
 import torch
 import torch.nn.functional as F
 import tilelang
@@ -210,7 +212,7 @@ class SparseFlashAttn(torch.nn.Module):
             max_selected_blocks=T.symbolic("max_selected_blocks"))
 
         self.kernel = tilelang.compile(
-            program, out_idx=-1, target='cuda', execution_backend="cython")
+            program, out_idx=-1, target='maca', execution_backend="cython")
 
         props = torch.cuda.get_device_properties(torch.device("cuda:0"))
         self.num_sm = props.multi_processor_count
@@ -318,7 +320,7 @@ def sparse_gqa_decode_varlen_indice(query, key, value, block_indices, cache_seql
     Output_partial = torch.empty((batch, heads, num_split, dim_v),
                                  dtype=torch.float32,
                                  device='cuda')
-    kernel = tilelang.compile(program, out_idx=-1, target='cuda', execution_backend="cython")
+    kernel = tilelang.compile(program, out_idx=-1, target='maca', execution_backend="cython")
     # print(kernel.get_kernel_source())
 
     # output = kernel(query, key, value, block_indices, cache_seqlens, actual_num_blocks, glse, Output_partial)

@@ -1,3 +1,5 @@
+// Copyright (c) 2025 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
+
 /*!
  * \file tl/op/elem.cc
  *
@@ -455,7 +457,7 @@ Stmt Fill::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     return vectorized_thread_loop;
   } else if (dst.scope() == "shared.dyn" || dst.scope() == "shared") {
     auto par_op = std::make_unique<ParallelOp>(MakeSIMTLoop(analyzer));
-    par_op->InferLayout({T.target, T.thread_bounds, T.layout_map},
+    par_op->InferLayout({T.target, T.thread_bounds, T.layout_map, T.buffer_remap},
                         InferLevel::kFree);
     auto thread_loop = PartitionLoop(par_op->GetRoot(), T.thread_var, analyzer,
                                      par_op->GetLoopLayout());

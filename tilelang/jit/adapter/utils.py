@@ -1,3 +1,5 @@
+# 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
 from __future__ import annotations
 
 import re
@@ -55,6 +57,8 @@ def is_cuda_target(target: Target) -> bool:
 def is_hip_target(target: Target) -> bool:
     return target.kind.name == "hip"
 
+def is_maca_target(target: Target) -> bool:
+    return target.kind.name == "maca"
 
 def is_cpu_target(target: Target) -> bool:
     return target.kind.name in ["c"]
