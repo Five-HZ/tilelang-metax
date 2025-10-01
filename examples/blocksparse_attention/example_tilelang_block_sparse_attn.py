@@ -1,3 +1,5 @@
+# 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
 import math
 import torch
 
@@ -33,7 +35,7 @@ def blocksparse_flashattn(batch, heads, seq_len, dim, downsample_len, is_causal)
     block_M = 64
     block_N = 64
     num_stages = 1
-    threads = 128
+    threads = 256
     scale = (1.0 / dim)**0.5 * 1.44269504  # log2(e)
     shape = [batch, heads, seq_len, dim]
     block_mask_shape = [batch, heads, downsample_len, downsample_len]
@@ -137,22 +139,20 @@ def blocksparse_flashattn(batch, heads, seq_len, dim, downsample_len, is_causal)
                 scores_scale = T.alloc_fragment([block_M], accum_dtype)
                 scores_sum = T.alloc_fragment([block_M], accum_dtype)
                 logsum = T.alloc_fragment([block_M], accum_dtype)
-                block_mask = T.alloc_local([downsample_len], block_mask_dtype)
+                block_mask = T.alloc_var("int")
 
                 T.copy(Q[bz, by, bx * block_M:(bx + 1) * block_M, :], Q_shared)
                 T.fill(acc_o, 0)
                 T.fill(logsum, 0)
                 T.fill(scores_max, -T.infinity(accum_dtype))
 
-                for vj in T.serial(downsample_len):
-                    block_mask[vj] = BlockSparseMask[bz, by, bx, vj]
-
                 loop_range = (
                     T.min(T.ceildiv(seq_len, block_N), T.ceildiv(
                         (bx + 1) * block_M, block_N)) if is_causal else T.ceildiv(seq_len, block_N))
 
                 for k in T.Pipelined(loop_range, num_stages=num_stages):
-                    if block_mask[k] != 0:
+                    block_mask = BlockSparseMask[bz, by, bx, k]
+                    if block_mask != 0:
                         MMA0(K, Q_shared, K_shared, acc_s, k, bx, by, bz)
                         Softmax(acc_s, acc_s_cast, scores_max, scores_max_prev, scores_scale,
                                 scores_sum, logsum)
@@ -215,6 +215,9 @@ def test_topk_sparse_attention():
     # Verify accuracy
     torch.testing.assert_close(tilelang_output, ref_output, atol=1e-2, rtol=1e-2)
     print("Pass topk sparse attention test with qlen == klen")
+    profiler = kernel.get_profiler(tensor_supply_type=tilelang.TensorSupplyType.Randn)
+    latency = profiler.do_bench(n_warmup=50, n_repeat=1000)
+    print(f"Latency: {latency} ms")
 
 
 def main():

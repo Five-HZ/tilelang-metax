@@ -4,8 +4,11 @@ from .arch_base import TileDevice
 from .cuda import CUDA
 from .cpu import CPU
 from .cdna import CDNA
+from .maca import MACA
 from typing import Union
+from tvm import device as tvm_device
 from tvm.target import Target
+from tvm.runtime import Device
 
 
 def get_arch(target: Union[str, Target] = "cuda") -> TileDevice:
