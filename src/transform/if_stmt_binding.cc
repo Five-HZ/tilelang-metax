@@ -3,6 +3,7 @@
  * \brief Bind the If Stmt to each Stmt in SeqStmt
  */
 
+#include <tvm/ffi/reflection/registry.h>
 #include <tvm/tir/analysis.h>
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/op.h>
@@ -32,13 +33,13 @@ private:
     auto then_case = VisitStmt(op->then_case);
     Optional<Stmt> else_case = op->else_case;
     if (else_case.defined()) {
-      return GetRef<Stmt>(op);
+      return tvm::ffi::GetRef<Stmt>(op);
     }
     ICHECK(then_case.defined()) << "then_case must be defined";
     ICHECK(!else_case.defined()) << "else_case must be undefined";
 
-    auto bind_if_stmt = [](Optional<Stmt> body,
-                           const PrimExpr condition) -> Stmt {
+    auto bind_if_stmt = [](const Optional<Stmt> &body,
+                           const PrimExpr &condition) -> Stmt {
       if (body.defined()) {
         auto stmt = body.value();
         if (auto seq_stmt = stmt.as<SeqStmtNode>()) {
@@ -74,13 +75,16 @@ private:
 
 using namespace tir::transform;
 tvm::transform::Pass IfStmtBinding() {
-  auto pass_func = [=](PrimFunc f, IRModule m, PassContext ctx) {
+  auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
     return IfStmtBindingRewriter::Substitute(f);
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.IfStmtBinding", {});
 }
 
-TVM_REGISTER_GLOBAL("tl.transform.IfStmtBinding").set_body_typed(IfStmtBinding);
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = tvm::ffi::reflection;
+  refl::GlobalDef().def("tl.transform.IfStmtBinding", IfStmtBinding);
+}
 
 } // namespace tl
 } // namespace tvm

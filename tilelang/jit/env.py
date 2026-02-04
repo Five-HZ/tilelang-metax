@@ -17,7 +17,7 @@
 # This file is modified from the original version,
 # which is part of the flashinfer project
 # (https://github.com/flashinfer-ai/flashinfer).
-"""Library information. This is a standalone file that can be used to get various info. 
+"""Library information. This is a standalone file that can be used to get various info.
 Modified from flashinfer
 """
 
@@ -29,21 +29,6 @@ from tilelang.env import (
 )
 
 
-def _initialize_torch_cuda_arch_flags():
-    import os
-    from tilelang.contrib import nvcc
-    from tilelang.utils.target import determine_target
-
-    target = determine_target(return_object=True)
-    # create tmp source file for torch cpp extension
-    compute_version = "".join(nvcc.get_target_compute_version(target).split("."))
-    # set TORCH_CUDA_ARCH_LIST
-    major = compute_version[0]
-    minor = compute_version[1]
-
-    os.environ["TORCH_CUDA_ARCH_LIST"] = f"{major}.{minor}"
-
-
 def _get_workspace_dir_name() -> pathlib.Path:
     try:
         from tilelang.contrib import nvcc
@@ -51,18 +36,13 @@ def _get_workspace_dir_name() -> pathlib.Path:
 
         target = determine_target(return_object=True)
         # create tmp source file for torch cpp extension
-        compute_version = "".join(nvcc.get_target_compute_version(target).split("."))
-        # set TORCH_CUDA_ARCH_LIST
-        major = compute_version[0]
-        minor = compute_version[1]
-        arch = f"{major}_{minor}"
+        arch = nvcc.get_target_arch(nvcc.get_target_compute_version(target))
     except Exception:
         arch = "noarch"
     # e.g.: $HOME/.cache/tilelang/75_80_89_90/
     return pathlib.Path.home() / ".cache" / "tilelang" / arch
 
 
-# _initialize_torch_cuda_arch_flags()
 TILELANG_JIT_WORKSPACE_DIR = _get_workspace_dir_name()
 TILELANG_JIT_DIR = TILELANG_JIT_WORKSPACE_DIR / "cached_ops"
 TILELANG_GEN_SRC_DIR = TILELANG_JIT_WORKSPACE_DIR / "generated"

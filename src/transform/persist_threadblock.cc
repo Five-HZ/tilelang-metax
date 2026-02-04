@@ -3,13 +3,13 @@
  * \brief Lower L2 persistent annotation
  */
 
+#include <tvm/ffi/reflection/registry.h>
 #include <tvm/tir/analysis.h>
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
 #include "../op/builtin.h"
-#include "../op/bulk_copy.h"
 #include "../runtime/runtime.h"
 
 namespace tvm {
@@ -53,14 +53,16 @@ private:
 using namespace tir::transform;
 
 tvm::transform::Pass PersistThreadblock() {
-  auto pass_func = [=](PrimFunc f, IRModule m, PassContext ctx) {
+  auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
     return PersistThreadblock::Substitute(f);
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.PersistThreadblock", {});
 }
 
-TVM_REGISTER_GLOBAL("tl.transform.PersistThreadblock")
-    .set_body_typed(PersistThreadblock);
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = tvm::ffi::reflection;
+  refl::GlobalDef().def("tl.transform.PersistThreadblock", PersistThreadblock);
+}
 
 } // namespace tl
 } // namespace tvm

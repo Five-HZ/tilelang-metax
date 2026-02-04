@@ -2,27 +2,17 @@ import tilelang
 import tilelang.language as T
 
 
-def matmul(M,
-           N,
-           K,
-           block_M,
-           block_N,
-           block_K,
-           split_k,
-           dtype="float16",
-           accum_dtype="float",
-           out_dtype="float32"):
-
+@tilelang.jit
+def matmul(M, N, K, block_M, block_N, block_K, split_k, dtype=T.float16, accum_dtype=T.float32, out_dtype=T.float32):
     splitK = K // split_k
 
     @T.prim_func
     def main(
-            A: T.Tensor((M, K), dtype),
-            B: T.Tensor((N, K), dtype),
-            C: T.Tensor((M, N), out_dtype),
+        A: T.Tensor((M, K), dtype),
+        B: T.Tensor((N, K), dtype),
+        C: T.Tensor((M, N), out_dtype),
     ):
-        with T.Kernel(
-                T.ceildiv(N, block_N), T.ceildiv(M, block_M), split_k, threads=128) as (bx, by, bz):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), split_k, threads=128) as (bx, by, bz):
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), out_dtype)
@@ -35,14 +25,6 @@ def matmul(M,
                 T.gemm(A_shared, B_shared, C_local)
 
             T.copy(C_local, C_shared)
-
-            # TODO: Automatically add vectorized atomic with enhancement
-            # https://github.com/tile-ai/tilelang/issues/523
-            # if DataType(dtype).bits == 16:
-            #     for i, j in T.Parallel(block_M, block_N // 2):
-            #         m, n = by * block_M + i, bx * block_N + j * 2
-            #         # vectorized atomic
-            #         T.atomic_addx2(C[m, n], C_shared[i, j * 2])
 
             for i, j in T.Parallel(block_M, block_N):
                 T.atomic_add(C[by * block_M + i, bx * block_N + j], C_shared[i, j])
@@ -59,9 +41,7 @@ def main():
     block_K = 32
     split_k = 4
 
-    program = matmul(M, N, K, block_M, block_N, block_K, split_k)
-
-    kernel = tilelang.compile(program)
+    kernel = matmul(M, N, K, block_M, block_N, block_K, split_k)
 
     import torch
 
@@ -74,6 +54,29 @@ def main():
     ref_c = a @ b
 
     torch.testing.assert_close(c, ref_c.to(c.dtype), rtol=1e-2, atol=1e-2)
+
+
+def run_regression_perf():
+    M = 4096
+    N = 4096
+    K = 4096
+    block_M = 128
+    block_N = 128
+    block_K = 32
+    split_k = 4
+    kernel = matmul(M, N, K, block_M, block_N, block_K, split_k)
+    import torch
+
+    torch.random.manual_seed(42)
+    a = torch.randn(M, K).cuda().half()
+    b = torch.randn(K, N).cuda().half()
+    c = torch.zeros(M, N).cuda().float()
+    from tilelang.profiler import do_bench
+
+    def run_kernel_only():
+        kernel(a, b, c)
+
+    return do_bench(run_kernel_only, backend="cupti")
 
 
 if __name__ == "__main__":

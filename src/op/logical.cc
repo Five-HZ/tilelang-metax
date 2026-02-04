@@ -1,15 +1,16 @@
-// 2025 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
-
+// 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 /*!
  * \file tl/op/logical.cc
  * \brief Logical operations.
  *
  */
 
-#include <tvm/runtime/registry.h>
+#include <tvm/ffi/function.h>
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/op.h>
 #include <tvm/tir/op_attr_types.h>
+
+#include "../support/ffi_aliases.h"
 
 namespace tvm {
 namespace tl {
@@ -43,7 +44,8 @@ TVM_REGISTER_OP("tl.any_of")
                                Integer(CallEffectKind::kPure))
     .set_attr<TScriptPrinterName>("TScriptPrinterName", "any_of")
     .set_attr<FLowerIntrinsic>("cuda.FLowerIntrinsic", any_of_op)
-    .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic", any_of_op);
+    .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic", any_of_op)
+    .set_attr<FLowerIntrinsic>("hip.FLowerIntrinsic", any_of_op);
 
 TVM_REGISTER_OP("tl.all_of")
     .set_num_inputs(1)
@@ -51,7 +53,8 @@ TVM_REGISTER_OP("tl.all_of")
                                Integer(CallEffectKind::kPure))
     .set_attr<TScriptPrinterName>("TScriptPrinterName", "all_of")
     .set_attr<FLowerIntrinsic>("cuda.FLowerIntrinsic", all_of_op)
-    .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic", all_of_op);
+    .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic", all_of_op)
+    .set_attr<FLowerIntrinsic>("hip.FLowerIntrinsic", all_of_op);
 
 } // namespace tl
 } // namespace tvm

@@ -4,8 +4,8 @@ import tilelang.language as T
 
 # add decorator @tilelang.jit if you want to return a torch function
 # @tilelang.jit
-def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float"):
-
+@tilelang.jit(out_idx=[2])
+def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float32):
     num_stages = 2
     mbarrier_list = [128, 128] * num_stages
 
@@ -22,27 +22,21 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="flo
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
 
             # create mbarrier for tma
-            T.create_list_of_mbarrier(mbarrier_list)
+            mbars = T.alloc_barrier(mbarrier_list)
 
             with T.ws(0):
                 T.clear(C_local)
 
             for ko in range(T.ceildiv(K, block_K)):
                 with T.ws(1):
-                    T.mbarrier_wait_parity(
-                        mbarrier=ko % num_stages + num_stages,
-                        parity=((ko // num_stages) % num_stages) ^ 1)
-                    T.copy(A[by * block_M:(by + 1) * block_M, ko * block_K:(ko + 1) * block_K],
-                           A_shared[ko % num_stages, :, :])
-                    T.copy(B[ko * block_K:(ko + 1) * block_K, bx * block_N:(bx + 1) * block_N],
-                           B_shared[ko % num_stages, :, :])
-                    T.mbarrier_arrive(mbarrier=ko % num_stages)
+                    T.mbarrier_wait_parity(mbarrier=mbars[ko % num_stages + num_stages], parity=((ko // num_stages) % num_stages) ^ 1)
+                    T.copy(A[by * block_M : (by + 1) * block_M, ko * block_K : (ko + 1) * block_K], A_shared[ko % num_stages, :, :])
+                    T.copy(B[ko * block_K : (ko + 1) * block_K, bx * block_N : (bx + 1) * block_N], B_shared[ko % num_stages, :, :])
+                    T.mbarrier_arrive(mbarrier=mbars[ko % num_stages])
                 with T.ws(0):
-                    T.mbarrier_wait_parity(
-                        mbarrier=ko % num_stages, parity=(ko // num_stages) % num_stages)
-                    T.gemm(A_shared[ko % num_stages, :, :], B_shared[ko % num_stages, :, :],
-                           C_local)
-                    T.mbarrier_arrive(mbarrier=ko % num_stages + num_stages)
+                    T.mbarrier_wait_parity(mbarrier=mbars[ko % num_stages], parity=(ko // num_stages) % num_stages)
+                    T.gemm(A_shared[ko % num_stages, :, :], B_shared[ko % num_stages, :, :], C_local)
+                    T.mbarrier_arrive(mbarrier=mbars[ko % num_stages + num_stages])
 
             with T.ws(0):
                 T.copy(C_local, C[by * block_M, bx * block_N])
@@ -50,26 +44,16 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="flo
     return main
 
 
-def main():
-    M = 16384
-    N = 16384
-    K = 16384
+def main(M=16384, N=16384, K=16384):
     block_M = 128
     block_N = 128
     block_K = 64
-    # 1. Define the kernel (matmul) and compile/lower it into an executable module
-    func = matmul(M, N, K, block_M, block_N, block_K)
+    jit_kernel = matmul(M, N, K, block_M, block_N, block_K)
 
-    # 2. Compile the kernel into a torch function
-    # out_idx specifies the index of the output buffer in the argument list
-    # if out_idx is specified, the tensor will be created during runtime
-    # target currently can be "cuda" or "hip" or "cpu".
-    jit_kernel = tilelang.compile(func, out_idx=[2])
+    print(jit_kernel.get_kernel_source())
 
-    # 3. Test the kernel in Python with PyTorch data
     import torch
 
-    # Create random input tensors on the GPU
     a = torch.randn(M, K, device="cuda", dtype=torch.float16)
     b = torch.randn(K, N, device="cuda", dtype=torch.float16)
 
@@ -93,6 +77,15 @@ def main():
     latency = profiler.do_bench()
 
     print(f"Latency: {latency} ms")
+
+
+def run_regression_perf(M=16384, N=16384, K=16384):
+    block_M = 128
+    block_N = 128
+    block_K = 64
+    jit_kernel = matmul(M, N, K, block_M, block_N, block_K)
+    profiler = jit_kernel.get_profiler(tensor_supply_type=tilelang.TensorSupplyType.Normal)
+    return profiler.do_bench(backend="cupti")
 
 
 if __name__ == "__main__":

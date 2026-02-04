@@ -1,50 +1,38 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership. The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
-
 /*!
  * \file warp_specialized_pipeline.cc
  * \brief Warp specialized Pipeline for cuda GPU (sm90+)
  */
 
+#include <tvm/ffi/reflection/registry.h>
 #include <tvm/tir/analysis.h>
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/op.h>
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
+#include <functional>
+#include <unordered_set>
+#include <utility>
+
 #include "../op/builtin.h"
+#include "../op/utils.h"
 
 namespace tvm {
 namespace tl {
 
 using namespace tir;
 
-enum class Role { kConsumer, kProducer, kBoth };
+enum class Role : uint8_t { kConsumer, kProducer, kBoth };
 
 class WarpSpecializedRoleMarker_ : public StmtVisitor {
 public:
   WarpSpecializedRoleMarker_(Map<Var, Buffer> buffer_data_to_buffer)
-      : buffer_data_to_buffer_(buffer_data_to_buffer) {}
+      : buffer_data_to_buffer_(std::move(buffer_data_to_buffer)) {}
 
   Role GetRole(const StmtNode *stmt) const {
     auto it = map_.find(stmt);
-    ICHECK(it != map_.end());
+    ICHECK(it != map_.end())
+        << " Cannot find role for stmt: " << stmt->GetTypeKey();
     return it->second;
   }
 
@@ -62,21 +50,19 @@ public:
   }
 
   void VisitStmt_(const BufferStoreNode *op) final {
-    bool is_shared_store =
-        op->buffer.scope() == "shared.dyn" || op->buffer.scope() == "shared";
-    if (!is_shared_store) {
+    if (!IsSharedBuffer(op->buffer)) {
       SetRole(op, Role::kConsumer);
       return;
     }
 
     // Check reads from global
     Block block(/*iter_vars=*/{}, /*reads=*/{}, /*writes=*/{}, /*name_hint=*/"",
-                /*body*/ GetRef<Stmt>(op));
+                /*body*/ tvm::ffi::GetRef<Stmt>(op));
     auto access = GetBlockReadWriteRegion(block, buffer_data_to_buffer_);
     auto reads = access[0];
     Role role = Role::kProducer;
     for (auto read : reads) {
-      if (read->buffer.scope() != "global") {
+      if (!IsGlobalBuffer(read->buffer)) {
         role = Role::kConsumer;
         break;
       }
@@ -124,6 +110,8 @@ public:
   void VisitStmt_(const AttrStmtNode *op) final { HandleBodyStmt(op); }
   void VisitStmt_(const AssertStmtNode *op) final { HandleBodyStmt(op); }
   void VisitStmt_(const BlockNode *op) final { HandleBodyStmt(op); }
+  void VisitStmt_(const AllocateNode *op) final { HandleBodyStmt(op); }
+  void VisitStmt_(const DeclBufferNode *op) final { HandleBodyStmt(op); }
 
   bool HasProducer() { return has_simt_copy_ || has_bulk_copy_; }
 
@@ -153,29 +141,95 @@ public:
 private:
   MultiVersionBufferRewriter() = default;
 
-  Array<Buffer> GetVersionedBuffers(Array<Stmt> seq_stmt,
-                                    Array<Buffer> scoped_buffers) {
+  Array<Buffer> GetVersionedBuffers(const Array<Stmt> &seq_stmt,
+                                    const Array<Buffer> &scoped_buffers) {
+    Array<Stmt> pipeline_stmts;
+    std::function<void(const Stmt &)> collect_stmts = [&](const Stmt &stmt) {
+      if (const auto *seq = stmt.as<SeqStmtNode>()) {
+        for (const Stmt &s : seq->seq) {
+          collect_stmts(s);
+        }
+        return;
+      }
+      if (const auto *let = stmt.as<LetStmtNode>()) {
+        collect_stmts(let->body);
+        return;
+      }
+      if (const auto *attr = stmt.as<AttrStmtNode>()) {
+        collect_stmts(attr->body);
+        return;
+      }
+      if (const auto *block_realize = stmt.as<BlockRealizeNode>()) {
+        collect_stmts(block_realize->block->body);
+        return;
+      }
+      if (const auto *block = stmt.as<BlockNode>()) {
+        collect_stmts(block->body);
+        return;
+      }
+      pipeline_stmts.push_back(stmt);
+    };
+    for (const Stmt &stmt : seq_stmt) {
+      collect_stmts(stmt);
+    }
+
     std::vector<Role> roles;
     Array<Array<BufferRegion>> reads, writes;
     auto marker = WarpSpecializedRoleMarker_(buffer_data_to_buffer_);
-    for (auto stmt : seq_stmt) {
+    for (const Stmt &stmt : pipeline_stmts) {
       marker(stmt);
       Block block(/*iter_vars=*/{}, /*reads=*/{}, /*writes=*/{},
                   /*name_hint=*/"", /*body*/ stmt);
       auto access = GetBlockAccessRegion(block, buffer_data_to_buffer_);
-      reads.push_back(std::move(access[0]));
-      writes.push_back(std::move(access[1]));
+      reads.push_back(access[0]);
+      writes.push_back(access[1]);
       roles.push_back(marker.GetRole(stmt));
     }
 
     std::unordered_set<const BufferNode *> consumer_used, producer_used;
-    for (size_t i = 0; i < seq_stmt.size(); i++) {
-      if (roles[i] == Role::kProducer) {
-        for (BufferRegion br : writes[i])
+    std::unordered_map<const BufferNode *, size_t> first_write_index;
+    std::unordered_map<const BufferNode *, size_t> last_read_index;
+    auto is_copy_stage = [&](size_t idx) {
+      bool has_shared_write = false;
+      for (const BufferRegion &wr : writes[idx]) {
+        if (IsSharedBuffer(wr->buffer)) {
+          has_shared_write = true;
+          break;
+        }
+      }
+      if (!has_shared_write)
+        return false;
+      for (const BufferRegion &rd : reads[idx]) {
+        if (IsGlobalBuffer(rd->buffer)) {
+          return true;
+        }
+      }
+      return false;
+    };
+    for (size_t i = 0; i < pipeline_stmts.size(); i++) {
+      bool copy_stage = is_copy_stage(i);
+      bool is_producer = roles[i] == Role::kProducer ||
+                         (roles[i] == Role::kBoth && copy_stage);
+      bool is_consumer = roles[i] == Role::kConsumer ||
+                         (roles[i] == Role::kBoth && !copy_stage);
+      if (is_producer) {
+        for (BufferRegion br : writes[i]) {
           producer_used.insert(br->buffer.get());
-      } else {
-        for (BufferRegion br : reads[i])
+        }
+      }
+      if (is_consumer) {
+        for (BufferRegion br : reads[i]) {
           consumer_used.insert(br->buffer.get());
+        }
+      }
+      for (BufferRegion br : writes[i]) {
+        const BufferNode *buf = br->buffer.get();
+        if (!first_write_index.count(buf)) {
+          first_write_index[buf] = i;
+        }
+      }
+      for (BufferRegion br : reads[i]) {
+        last_read_index[br->buffer.get()] = i;
       }
     }
     Array<Buffer> versioned_buffers;
@@ -183,15 +237,27 @@ private:
       if (consumer_used.count(buffer.get()) &&
           producer_used.count(buffer.get())) {
         versioned_buffers.push_back(buffer);
+        continue;
+      }
+      // Fallback: if we saw a write before a later read, the buffer spans
+      // multiple stages even if role classification missed one side.
+      auto it_w = first_write_index.find(buffer.get());
+      auto it_r = last_read_index.find(buffer.get());
+      if (it_w != first_write_index.end() && it_r != last_read_index.end() &&
+          it_w->second < it_r->second) {
+        if (!is_copy_stage(it_w->second))
+          continue;
+        versioned_buffers.push_back(buffer);
       }
     }
     return versioned_buffers;
   }
 
   static Buffer RewriteAllocBuffer(const Buffer &buffer, int num_versions) {
-    ObjectPtr<BufferNode> new_buffer = make_object<BufferNode>(*(buffer.get()));
+    ObjectPtr<BufferNode> new_buffer =
+        tvm::ffi::make_object<BufferNode>(*(buffer.get()));
     new_buffer->shape.insert(new_buffer->shape.begin(), PrimExpr(num_versions));
-    if (new_buffer->strides.size()) {
+    if (!new_buffer->strides.empty()) {
       ICHECK(new_buffer->strides.size() + 1 == new_buffer->shape.size());
       PrimExpr stride_0 = new_buffer->strides[0] * new_buffer->shape[1];
       new_buffer->strides.insert(new_buffer->strides.begin(), stride_0);
@@ -213,31 +279,109 @@ private:
       }
     }
     block.CopyOnWrite()->alloc_buffers = std::move(alloc_buffers);
+    // Record the updated alloc list to recover buffers whose LCA is the block.
+    block_alloc_buffers_[op->block.get()] = block->alloc_buffers;
     block_realize.CopyOnWrite()->block = block;
     return block_realize;
   }
 
+  Stmt VisitStmt_(const BlockNode *op) final {
+    stmt_stack_.push_back(op);
+    Stmt stmt = StmtExprMutator::VisitStmt_(op);
+    stmt_stack_.pop_back();
+    return stmt;
+  }
+
   Stmt VisitStmt_(const ForNode *op) final {
+    stmt_stack_.push_back(op);
     loop_stack_.emplace_back(op->loop_var, op->extent);
     auto num_stages_anno = op->annotations.Get("num_stages");
-    if (!num_stages_anno.defined()) {
+    if (!num_stages_anno) {
       auto for_node = StmtExprMutator::VisitStmt_(op);
       loop_stack_.pop_back();
+      stmt_stack_.pop_back();
       return for_node;
     }
 
-    ICHECK(num_stages_anno.as<IntImmNode>());
-    int num_stages = static_cast<int>(num_stages_anno.as<IntImmNode>()->value);
+    ICHECK(num_stages_anno->as<IntImmNode>());
+    int num_stages = static_cast<int>(num_stages_anno->as<IntImmNode>()->value);
 
-    const SeqStmtNode *pipeline_body_seq = op->body.as<SeqStmtNode>();
-    CHECK(pipeline_body_seq) << "ValueError: The body of the software pipeline "
-                                "should be SeqStmt, got "
-                             << op->body->GetTypeKey();
+    Stmt pipeline_body_root{nullptr};
+    if (const auto *realize = op->body.as<BlockRealizeNode>()) {
+      const auto &block = realize->block;
+      for (const auto &buffer : block->alloc_buffers) {
+        ICHECK(buffer->IsInstance<BufferNode>());
+        buffer_data_to_buffer_.Set(buffer->data, buffer);
+      }
+      pipeline_body_root = block->body;
+    } else {
+      pipeline_body_root = op->body;
+    }
 
-    Array<Buffer> scoped_buffers = {};
+    const SeqStmtNode *pipeline_body_seq = nullptr;
+    {
+      // Traverse trivial wrappers (let/if) to find the actual SeqStmt body.
+      Stmt current = pipeline_body_root;
+      while (true) {
+        if (const auto *seq_stmt = current.as<SeqStmtNode>()) {
+          pipeline_body_seq = seq_stmt;
+          break;
+        }
+        if (const auto *if_then_else = current.as<IfThenElseNode>()) {
+          ICHECK(!if_then_else->else_case.defined())
+              << "MultiVersionBuffer: Can't handle the body of the loop "
+                 "because the IfThenElse node has an else branch";
+          current = if_then_else->then_case;
+          continue;
+        }
+        if (const auto *let_stmt = current.as<LetStmtNode>()) {
+          current = let_stmt->body;
+          continue;
+        }
+        LOG(FATAL)
+            << "MultiVersionBuffer: Can't handle the body of the loop because "
+            << "it is not a SeqStmt, IfThenElse without else, "
+            << "or LetStmt wrapping them, but got " << current->GetTypeKey();
+      }
+    }
+    ICHECK(pipeline_body_seq != nullptr);
+
+    Array<Buffer> scoped_buffers;
+    std::unordered_set<const BufferNode *> seen;
     for (auto [buffer, stmt] : buffer_lca_) {
-      if (stmt.defined() && stmt.value().get() == op)
+      if (!stmt.defined())
+        continue;
+      const StmtNode *lca = stmt.value().get();
+      bool in_scope = false;
+      for (const StmtNode *ancestor : stmt_stack_) {
+        if (ancestor == lca) {
+          in_scope = true;
+          break;
+        }
+      }
+      if (!in_scope)
+        continue;
+      // Only double-buffer shared allocations; locals do not need versioning.
+      if (!IsSharedBuffer(buffer))
+        continue;
+      if (seen.insert(buffer.get()).second) {
         scoped_buffers.push_back(buffer);
+      }
+    }
+    for (auto it = stmt_stack_.rbegin(); it != stmt_stack_.rend(); ++it) {
+      if (!(*it)->IsInstance<BlockNode>())
+        continue;
+      const auto *block = static_cast<const BlockNode *>(*it);
+      auto map_it = block_alloc_buffers_.find(block);
+      if (map_it == block_alloc_buffers_.end())
+        continue;
+      for (const Buffer &buffer : map_it->second) {
+        if (!IsSharedBuffer(buffer))
+          continue;
+        if (seen.insert(buffer.get()).second) {
+          scoped_buffers.push_back(buffer);
+        }
+      }
     }
 
     Array<Buffer> versioned_buffers =
@@ -256,6 +400,7 @@ private:
     version_index_ = FloorMod(linear_index, num_stages);
     auto for_node = StmtExprMutator::VisitStmt_(op);
     loop_stack_.pop_back();
+    stmt_stack_.pop_back();
 
     return for_node;
   }
@@ -295,10 +440,12 @@ private:
   }
 
   PrimExpr RewriteBufferAccess(const Call &call,
-                               const std::vector<int> arg_indices) {
+                               const std::vector<int> &arg_indices) {
     auto product = [](const Array<PrimExpr> &input) {
       return foldl(
-          [](PrimExpr a, PrimExpr b, Span span) { return mul(a, b, span); },
+          [](PrimExpr a, PrimExpr b, Span span) {
+            return mul(std::move(a), std::move(b), std::move(span));
+          },
           make_const(DataType::Int(32), 1), input);
     };
     Array<PrimExpr> new_args = call->args;
@@ -321,27 +468,35 @@ private:
         new_args.Set(i + 1, new_index);
       }
     }
-    return Call(call->dtype, call->op, new_args, call->span);
+    return Call(call->dtype, call->op, new_args, call->annotations, call->span);
   }
 
   PrimExpr version_index_;
   std::vector<std::pair<Var, PrimExpr>> loop_stack_;
+  // Track ancestor statements to query whether an LCA is inside the current
+  // loop.
+  std::vector<const StmtNode *> stmt_stack_;
   Map<Var, Buffer> buffer_data_to_buffer_;
   Map<Buffer, Optional<Stmt>> buffer_lca_;
   Map<Buffer, Buffer> buffer_remap_;
+  // Remember each block's alloc list so the loop can see buffers defined in
+  // parents.
+  std::unordered_map<const BlockNode *, Array<Buffer>> block_alloc_buffers_;
 };
 
 using namespace tir::transform;
 
 tvm::transform::Pass MultiVersionBuffer() {
-  auto pass_func = [=](PrimFunc f, IRModule m, PassContext ctx) {
+  auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
     return MultiVersionBufferRewriter::Substitute(f);
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.MultiVersionBuffer", {});
 }
 
-TVM_REGISTER_GLOBAL("tl.transform.MultiVersionBuffer")
-    .set_body_typed(MultiVersionBuffer);
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = tvm::ffi::reflection;
+  refl::GlobalDef().def("tl.transform.MultiVersionBuffer", MultiVersionBuffer);
+}
 
 } // namespace tl
 } // namespace tvm

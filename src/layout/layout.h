@@ -1,5 +1,4 @@
-// 2025 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
-
+// 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 /*!
  * \file Layout.h
  *
@@ -8,12 +7,37 @@
 #ifndef TVM_TL_LAYOUT_LAYOUT_H_
 #define TVM_TL_LAYOUT_LAYOUT_H_
 
+#include <exception>
 #include <tvm/arith/analyzer.h>
+#include <tvm/arith/iter_affine_map.h>
+#include <tvm/ffi/object.h>
+#include <utility>
+
+#include "../support/ffi_aliases.h"
 
 namespace tvm {
 namespace tl {
 
 using namespace tir;
+
+// Common layout-related exceptions
+class LayoutConflictException : public std::exception {
+public:
+  const char *what() const noexcept override { return msg_.c_str(); }
+  explicit LayoutConflictException(const std::string &msg) : msg_(msg) {}
+
+private:
+  std::string msg_;
+};
+
+class LoopLayoutInjectiveException : public std::exception {
+public:
+  const char *what() const noexcept override { return msg_.c_str(); }
+  explicit LoopLayoutInjectiveException(const std::string &msg) : msg_(msg) {}
+
+private:
+  std::string msg_;
+};
 
 class Layout;
 class Fragment;
@@ -39,15 +63,29 @@ public:
 
   virtual Layout Inverse() const;
 
+  // Reshape the layout to a new logical shape. When aliasing buffers of
+  // different dtypes, the element count may change while the underlying
+  // byte-size stays equal. Use rescale_num/rescale_den to represent the
+  // ratio between the old element size and the new element size in bytes.
+  // Specifically, define factor = rescale_num / rescale_den where:
+  //   new_num_elems = old_num_elems * factor
+  // For example, f32->i8 (4B -> 1B) uses rescale_num=4, rescale_den=1.
+  // i8->f32 (1B -> 4B) uses rescale_num=1, rescale_den=4.
+  virtual Layout Reshape(const Array<PrimExpr> &shape,
+                         arith::Analyzer *analyzer,
+                         const PrimExpr rescale_num = Integer(1),
+                         const PrimExpr rescale_den = Integer(1)) const;
+
+  virtual std::pair<Layout, arith::IterMapLevel> InverseWithLevel() const;
+
   virtual std::string DebugOutput() const;
 
   virtual bool IsEqual(const LayoutNode *other, bool skip_index = false) const;
 
-  static constexpr bool _type_has_method_sequal_reduce = true;
-  static constexpr const char *_type_key = "tl.Layout";
-  bool SEqualReduce(const LayoutNode *other, SEqualReducer equal) const;
-  void VisitAttrs(tvm::AttrVisitor *v);
-  TVM_DECLARE_BASE_OBJECT_INFO(LayoutNode, Object);
+  static void RegisterReflection();
+  TVM_FFI_DECLARE_OBJECT_INFO("tl.Layout", LayoutNode, Object);
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
+      kTVMFFISEqHashKindTreeNode;
 
 protected:
   virtual Map<Var, Range> getVarMap() const;
@@ -64,7 +102,7 @@ public:
   TVM_DLL Layout(Array<IterVar> forward_var, Array<PrimExpr> forward_index);
   TVM_DLL Layout(Array<PrimExpr> input_size, Array<PrimExpr> forward_index);
 
-  TVM_DEFINE_OBJECT_REF_METHODS(Layout, ObjectRef, LayoutNode);
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(Layout, ObjectRef, LayoutNode);
 };
 
 class FragmentNode : public LayoutNode {
@@ -78,6 +116,12 @@ public:
   Array<PrimExpr> GetForwardVars() const final;
 
   Layout Inverse() const final;
+
+  Layout Reshape(const Array<PrimExpr> &shape, arith::Analyzer *analyzer,
+                 const PrimExpr rescale_num = Integer(1),
+                 const PrimExpr rescale_den = Integer(1)) const;
+
+  std::pair<Layout, arith::IterMapLevel> InverseWithLevel() const final;
 
   PrimExpr ThreadExtent() const;
 
@@ -103,11 +147,15 @@ public:
 
   bool IsEqual(const FragmentNode *other, bool skip_index = false) const;
 
-  void VisitAttrs(tvm::AttrVisitor *v);
+  bool IsCompletedReplicated() const;
 
-  bool SEqualReduce(const FragmentNode *other, SEqualReducer equal) const;
-  static constexpr const char *_type_key = "tl.Fragment";
-  TVM_DECLARE_FINAL_OBJECT_INFO(FragmentNode, LayoutNode);
+  arith::IterMapResult DetectInjective() const;
+
+  static void RegisterReflection();
+
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.Fragment", FragmentNode, LayoutNode);
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
+      kTVMFFISEqHashKindTreeNode;
 
 protected:
   Map<Var, Range> getVarMap() const final;
@@ -128,17 +176,35 @@ public:
                    PrimExpr forward_thread, PrimExpr replicate_size,
                    Optional<Var> replicate_var);
 
-  TVM_DEFINE_OBJECT_REF_METHODS(Fragment, Layout, FragmentNode);
+  /*!
+   * \brief Create a fully replicated fragment layout.
+   *
+   * A fully replicated fragment means all threads hold identical copies of the
+   * entire buffer. This is useful for index buffers or masks that need to be
+   * accessed uniformly across all threads.
+   *
+   * \param shape The shape of the buffer.
+   * \param thread_extent The number of threads.
+   * \return A Fragment where each thread has a complete copy of all elements.
+   */
+  TVM_DLL static Fragment FullyReplicated(Array<PrimExpr> shape,
+                                          PrimExpr thread_extent);
+
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(Fragment, Layout, FragmentNode);
 };
 
 Var InputPlaceholder(size_t idx);
 Var ReplicationPlaceholder();
+IterVar make_itervar(std::string name, PrimExpr dom);
 
 Fragment makeGemmFragment8x8();
 Fragment makeGemmFragment8x8Transposed();
 Fragment makeGemmFragmentC(const int block_m, const int block_n,
                            const int warp_m, const int warp_n,
                            const int element_size);
+Fragment makeGemmSparseFragmentC(const int block_m, const int block_n,
+                                 const int warp_m, const int warp_n,
+                                 const int element_size);
 Fragment makeGemmFragmentCCDNA(const int block_m, const int block_n,
                                const int warp_m, const int warp_n,
                                const int element_size);
@@ -155,24 +221,28 @@ Fragment makeGemmFragmentA(const int block_m, const int block_n,
 Fragment makeGemmFragmentB(const int block_m, const int block_n,
                            const int block_k, const int warp_m,
                            const int warp_n, bool transposed = false);
+
 Fragment makeGemmFragmentACDNA(const int block_m, const int block_n,
                                const int block_k, const int warp_m,
                                const int warp_n, const int element_size,
-                               bool transposed = false);
+                               const int k_pack, bool transposed = false);
 Fragment makeGemmFragmentAMACA(const int block_m, const int block_n,
                                const int block_k, const int warp_m,
                                const int warp_n, const int element_size,
                                bool transposed = false);
 
-// Default Memory Layout
-Layout makeGemmLayoutLinear(int stride, int continuous);
+// Default Memory Layout (row-major linear layout for any dimension)
+Layout makeLinearLayout(Array<PrimExpr> shape);
 Layout makeGemmABLayoutPadded(int stride, int continuous, int element_size);
 Layout makeGemmABLayout(int mat_stride, int mat_continuous, int continuity,
-                        int element_size, int kfactor);
+                        int element_size, bool k_inner = true);
 Layout makeGemmABLayoutHopper(int mat_stride, int mat_continuous,
-                              int continuity, int element_size, int kfactor);
+                              int continuity, int element_size,
+                              bool k_inner = true);
+Layout makeGemmABLayoutSm100(int mat_stride, int mat_continuous, int continuity,
+                             int element_size, bool k_inner = true);
 Layout makeGemmABLayoutCDNA(int stride, int continuous, int element_size,
-                            int kfactor);
+                            int kPack);
 Layout makeGemmABLayoutMACA(int mat_stride, int mat_continuous, int continuity,
                             int element_size, int kfactor);
 
@@ -183,16 +253,46 @@ Fragment makeGemmVoltaFragmentA(const int block_m, const int block_n,
                                 const int block_k, const int warp_m,
                                 const int warp_n);
 Layout makeGemmVoltaABLayout(int stride, int continuous, bool is_a,
-                             int kfactor);
+                             bool k_inner = true);
+
+Layout makeTensorOpMultiplicand(int mat_stride, int mat_continuous,
+                                int elementsize, int crosswise);
+Layout makeGemmSparseAmpereABLayout(int mat_stride, int mat_continuous,
+                                    int elementsize);
 
 Layout makeFullBankSwizzleLayout(int stride, int continuous, int element_size);
 Layout makeHalfBankSwizzleLayout(int stride, int continuous, int element_size);
 Layout makeQuarterBankSwizzleLayout(int stride, int continuous,
                                     int element_size);
 
+// Swizzle mode for shared memory layouts (nvidia only)
+// Smaller enum value = smaller swizzle granularity
+enum class SwizzleMode {
+  kNone = 0,    // Not a swizzle layout (linear or padded)
+  kQuarter = 1, // 32B swizzle (CU_TENSOR_MAP_SWIZZLE_32B)
+  kHalf = 2,    // 64B swizzle (CU_TENSOR_MAP_SWIZZLE_64B)
+  kFull = 3     // 128B swizzle (CU_TENSOR_MAP_SWIZZLE_128B)
+};
+
+// Detect which swizzle mode a layout uses
+SwizzleMode DetectSwizzleMode(const Layout &layout, int stride, int continuous,
+                              int element_size);
+
+// Merge two swizzle layouts by taking the smaller granularity
+// Returns NullOpt if either layout is not a swizzle layout
+Optional<Layout> MergeSwizzleLayouts(const Layout &layout1,
+                                     const Layout &layout2, int stride,
+                                     int continuous, int element_size);
+
 namespace attr {
 // BlockAttr, Containing the layout for all the buffers in the block
 constexpr const char *kLayoutMap = "layout_map";
+// ForAttr, Containing the parallel loop layout for a parallel for loop
+constexpr const char *kParallelLoopLayout = "parallel_loop_layout";
+// ForAttr, Containing the predicate for a parallel for loop
+constexpr const char *kParallelLoopPredicate = "parallel_loop_predicate";
+// ForAttr, Width (in elements) for coalesced memory access
+constexpr const char *kCoalescedWidth = "coalesced_width";
 } // namespace attr
 
 } // namespace tl

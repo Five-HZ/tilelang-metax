@@ -4,7 +4,7 @@
 
 #include "codegen_hip.h"
 #include <tvm/arith/analyzer.h>
-#include <tvm/runtime/registry.h>
+#include <tvm/ffi/function.h>
 #include <tvm/tir/index_map.h>
 #include <tvm/tir/op.h>
 
@@ -14,7 +14,6 @@
 #include <vector>
 
 #include "../op/builtin.h"
-#include "../op/bulk_copy.h"
 #include "target/source/ptx.h"
 
 namespace tvm {
@@ -38,14 +37,16 @@ static std::string GetFP8Type(DataType type) {
     LOG(FATAL) << "Only support scalar and vector types of width (2, 4, 8, 16) "
                   "for FP8";
   }
-  if (type.code() == DataType::kFloat8_e4m3fn) {
+  if (type.is_float8_e4m3fn() || type.is_float8_e4m3fnuz() ||
+      type.is_float8_e4m3() || type.code() == DataType::kFloat8_e4m3b11fnuz) {
     stream << "fp8_e4" << vec << "_t";
-  } else if (type.code() == DataType::kFloat8_e4m3fnuz) {
-    stream << "fp8_e4" << vec << "_t";
-  } else if (type.code() == DataType::kFloat8_e5m2) {
+  } else if (type.is_float8_e5m2() || type.is_float8_e5m2fnuz() ||
+             type.code() == DataType::kFloat8_e5m2) {
     stream << "fp8_e5" << vec << "_t";
+  } else if (type.code() == DataType::kFloat8_e8m0fnu) {
+    stream << "fp8_e8" << vec << "_t";
   } else {
-    LOG(FATAL) << "Unsupported FP8 type in HIP codegen";
+    LOG(FATAL) << "Unsupported FP8 type in HIP codegen: " << type;
   }
   return stream.str();
 }
@@ -481,7 +482,7 @@ void CodeGenTileLangHIP::PrintVecElemLoad(const std::string &vec, DataType t,
     os << "((half2*)(&(" << vec << "." << access[i / 2] << ")))->"
        << access[i % 2];
   } else if (t.is_bfloat16()) {
-    os << "((nv_bfloat162*)(&(" << vec << "." << access[i / 2] << ")))->"
+    os << "((bfloat16x2*)(&(" << vec << "." << access[i / 2] << ")))->"
        << access[i % 2];
   } else if (t.lanes() > 4 && t.lanes() <= 8) {
     std::string type_name;
@@ -760,24 +761,26 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     }
     this->stream << ");\n";
   };
-  if (op->op.same_as(builtin::ptx_cp_async())) {
+  if (op->op.same_as(builtin::ptx_cp_async()) ||
+      op->op.same_as(tl::ptx_cp_async())) {
+    // args[0] = dst_access_ptr, args[1] = src_access_ptr, args[2] = bytes,
+    // args[3] = predicate (optional)
+    ICHECK(op->args.size() == 3 || op->args.size() == 4)
+        << "ptx_cp_async expects 3 or 4 arguments (dst_access_ptr, "
+           "src_access_ptr, bytes, [predicate])";
     std::string dst = this->PrintExpr(op->args[0]);
-    std::string dst_offset = this->PrintExpr(op->args[1]);
-    std::string src = this->PrintExpr(op->args[2]);
-    std::string src_offset = this->PrintExpr(op->args[3]);
-    std::string size = this->PrintExpr(op->args[4]);
-    // use size of argument list to indicate whether or not to use predicated
-    // cp.async
-    if (op->args.size() == 5) {
-      this->PrintIndent();
-      this->stream << "tl::cp_async_gs<" << size << ">(" << dst << "+"
-                   << dst_offset << ", " << src << "+" << src_offset << ");\n";
+    std::string src = this->PrintExpr(op->args[1]);
+    std::string size = this->PrintExpr(op->args[2]);
+    this->PrintIndent();
+    if (op->args.size() == 3) {
+      // Non-predicated version
+      this->stream << "tl::cp_async_gs<" << size << ">(" << dst << ", " << src
+                   << ");\n";
     } else {
-      std::string condition = this->PrintExpr(op->args[5]);
-      this->PrintIndent();
+      // Predicated version
+      std::string condition = this->PrintExpr(op->args[3]);
       this->stream << "tl::cp_async_gs_conditional<" << size << ">(" << dst
-                   << "+" << dst_offset << ", " << src << "+" << src_offset
-                   << ", " << condition << ");\n";
+                   << ", " << src << ", " << condition << ");\n";
     }
   } else if (op->op.same_as(builtin::ptx_commit_group())) {
     print_extern_call_stmt("tl::cp_async_commit");
@@ -807,9 +810,7 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     print_extern_call_stmt("tl::mbarrier_expect_tx");
   } else if (op->op.same_as(tl::mbarrier_wait_parity())) {
     print_extern_call_stmt("tl::mbarrier_wait");
-  } else if (op->op.same_as(tl::sync_thread_partial())) {
-    print_extern_call_stmt("tl::syncthreads_partial");
-  } else if (op->op.same_as(tl::ptx_stmatirx())) {
+  } else if (op->op.same_as(tl::ptx_stmatrix())) {
     int trans = Downcast<IntImm>(op->args[0])->value;
     int num = Downcast<IntImm>(op->args[1])->value;
     std::string func_name = "tl::ptx_stmatrix_x" + std::to_string(num);
@@ -823,6 +824,16 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(tl::pack_b16())) {
     os << "__pack_half2(" << this->PrintExpr(op->args[0]) << ", "
        << this->PrintExpr(op->args[1]) << ")";
+  } else if (op->op.same_as(tl::__ldg())) {
+    // HIP fallback: regular load
+    const BufferLoadNode *bl = op->args[0].as<BufferLoadNode>();
+    ICHECK(bl) << "T.__ldg expects a BufferLoad as the first argument.";
+    ICHECK_EQ(bl->indices.size(), 1)
+        << "T.__ldg currently supports flattened 1D buffer accesses.";
+    const BufferNode *buffer = bl->buffer.get();
+    PrimExpr base = bl->indices[0];
+    auto buffer_ref = this->GetBufferRef(op->dtype, buffer, base);
+    os << buffer_ref;
   } else if (op->op.same_as(builtin::tvm_fill_fragment())) {
     need_mma_h_ = true;
     ICHECK_EQ(op->args.size(), 6U);
@@ -882,8 +893,8 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
       this->PrintExpr(op->args[i * 2 + 1], os);
       os << "]" << ((i < 3) ? ", " : ")");
     }
-  } else if (op->op.same_as(builtin::tvm_mfma())) {
-    // arg 0: prefix: {otype}_16x16x16{itype}
+  } else if (op->op.same_as(tl::tvm_mfma())) {
+    // arg 0: prefix: {otype}_{intrM}x{intrN}x{intrK}_{itype}
     // arg 1: A layout: row/col
     // arg 2: B layout: row/col
     // arg 3: A precision: float16, float32, ...
@@ -917,28 +928,33 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
         {"int8", "char"},
         {"int32", "int"},
         {"int8x4", "int32_t"},
+        {"int8x8", "int64_t"},
         {"int32x4", "int32x4"},
         {"float16", "half"},
         {"float32", "float"},
         {"float64", "double"},
         {"float16x4", "float16x4"},
-        {"bfloat16x4", "bfloat16x4"},
+        {"bfloat16x4", "bfloat16x4_vec"},
         {"float32x4", "float32x4"},
         {"float8_e4m3fnuzx4", "fp8_e4_4_t"},
+        {"float8_e4m3fnx4", "fp8_e4_4_t"},
         {"float8_e4m3fnuzx8", "long"},
+        {"float8_e4m3fnx8", "long"},
+        {"float8_e5m2fnuzx4", "fp8_e5_4_t"},
+        {"float8_e5m2fnuzx8", "long"},
         {"float32x16", "float32x16"}};
     std::string call_mfma_code = R"({
-    *((({C_dytpe}*){c_ref}) + {c_bias}) = {mfma_buildin}(*((({A_dytpe}*){a_ref}) + {a_bias}),
-                  *((({B_dytpe}*){b_ref}) + {b_bias}),
-                  *((({C_dytpe}*){c_ref}) + {c_bias}), 0, 0, 0);
-  })";
+      *((({C_dtype}*){c_ref}) + {c_bias}) = {mfma_buildin}(*((({A_dtype}*){a_ref}) + {a_bias}),
+                    *((({B_dtype}*){b_ref}) + {b_bias}),
+                    *((({C_dtype}*){c_ref}) + {c_bias}), 0, 0, 0);
+    })";
     std::string mfma_buildin = "__builtin_amdgcn_mfma_" + prefix;
     Replacer replacer;
 
     replacer.register_rule("{mfma_buildin}", mfma_buildin);
-    replacer.register_rule("{A_dytpe}", dtype_map[A_dtype]);
-    replacer.register_rule("{B_dytpe}", dtype_map[B_dtype]);
-    replacer.register_rule("{C_dytpe}", dtype_map[C_dtype]);
+    replacer.register_rule("{A_dtype}", dtype_map[A_dtype]);
+    replacer.register_rule("{B_dtype}", dtype_map[B_dtype]);
+    replacer.register_rule("{C_dtype}", dtype_map[C_dtype]);
     replacer.register_rule("{a_ref}", a_ref);
     replacer.register_rule("{a_bias}", a_bias);
     replacer.register_rule("{b_ref}", b_ref);
@@ -946,6 +962,123 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     replacer.register_rule("{c_ref}", c_ref);
     replacer.register_rule("{c_bias}", c_bias);
     os << replacer.rewrite(call_mfma_code);
+  } else if (op->op.same_as(builtin::thread_return())) {
+    os << "return";
+  } else if (op->op.same_as(tl::tl_gemm())) {
+    ICHECK(op->args.size() == 4) << "tl_gemm expects 4 arguments <op_instance, "
+                                    "A_ptr, B_ptr, C_ptr>, but got "
+                                 << op->args.size();
+    auto op_instance = Downcast<StringImm>(op->args[0]);
+    this->PrintCallExtern(GetType(tvm::ffi::GetRef<PrimExpr>(op)),
+                          op_instance->value, op->args, true, os);
+  } else if (op->op.same_as(tl::tl_gemm_sp())) {
+    LOG(FATAL) << "tl_gemm_sp is not supported on HIP";
+  } else if (op->op.same_as(tl::loop_break())) {
+    this->PrintIndent();
+    this->stream << "break;\n";
+  } else if (op->op.same_as(tl::no_set_max_nreg())) {
+    // HIP doesn't need explicit register management like CUDA
+    // This is a no-op for HIP
+    return;
+  } else if (op->op.same_as(tl::warp_reduce_sum())) {
+    os << "tl::warp_reduce_sum(" << PrintExpr(op->args[0]) << ")";
+  } else if (op->op.same_as(tl::warp_reduce_max())) {
+    os << "tl::warp_reduce_max(" << PrintExpr(op->args[0]) << ")";
+  } else if (op->op.same_as(tl::warp_reduce_min())) {
+    os << "tl::warp_reduce_min(" << PrintExpr(op->args[0]) << ")";
+  } else if (op->op.same_as(tl::warp_reduce_bitand())) {
+    os << "tl::warp_reduce_bitand(" << PrintExpr(op->args[0]) << ")";
+  } else if (op->op.same_as(tl::warp_reduce_bitor())) {
+    os << "tl::warp_reduce_bitor(" << PrintExpr(op->args[0]) << ")";
+  } else if (op->op.same_as(tl::atomic_add_elem_op())) {
+    // atomic_add_elem_op(dst_ptr, src_value[, memory_order])
+    std::string dst_ptr = PrintExpr(op->args[0]);
+    std::string src_value = PrintExpr(op->args[1]);
+    this->PrintIndent();
+    this->stream << "AtomicAdd(" << dst_ptr << ", " << src_value;
+    if (op->args.size() > 2) {
+      this->stream << ", " << PrintExpr(op->args[2]);
+    }
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::atomic_add_ret_elem_op())) {
+    // atomic_add_ret_elem_op(dst_ptr, src_value[, memory_order]) -> returns
+    // prev value
+    os << "AtomicAddRet(" << PrintExpr(op->args[0]) << ", "
+       << PrintExpr(op->args[1]);
+    if (op->args.size() > 2) {
+      os << ", " << PrintExpr(op->args[2]);
+    }
+    os << ")";
+  } else if (op->op.same_as(tl::atomic_addx2_elem_op())) {
+    // atomic_addx2_elem_op(dst_ptr, src_ptr[, memory_order])
+    std::string dst_ptr = PrintExpr(op->args[0]);
+    std::string src_ptr = PrintExpr(op->args[1]);
+    this->PrintIndent();
+    this->stream << "AtomicAddx2(" << dst_ptr << ", " << src_ptr;
+    if (op->args.size() > 2) {
+      this->stream << ", " << PrintExpr(op->args[2]);
+    }
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::atomic_addx4_elem_op())) {
+    // atomic_addx4_elem_op(dst_ptr, src_ptr[, memory_order])
+    std::string dst_ptr = PrintExpr(op->args[0]);
+    std::string src_ptr = PrintExpr(op->args[1]);
+    this->PrintIndent();
+    this->stream << "AtomicAddx4(" << dst_ptr << ", " << src_ptr;
+    if (op->args.size() > 2) {
+      this->stream << ", " << PrintExpr(op->args[2]);
+    }
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::atomic_load_elem_op())) {
+    // atomic_load_elem_op(src_ptr, memory_order) -> returns loaded value
+    os << "AtomicLoad(" << PrintExpr(op->args[0]) << ", "
+       << PrintExpr(op->args[1]) << ")";
+  } else if (op->op.same_as(tl::atomic_store_elem_op())) {
+    // atomic_store_elem_op(dst_ptr, value, memory_order)
+    std::string dst_ptr = PrintExpr(op->args[0]);
+    std::string value = PrintExpr(op->args[1]);
+    std::string memory_order = PrintExpr(op->args[2]);
+    this->PrintIndent();
+    this->stream << "AtomicStore(" << dst_ptr << ", " << value << ", "
+                 << memory_order << ");\n";
+  } else if (op->op.same_as(tl::atomic_max_elem_op())) {
+    // atomic_max_elem_op(dst_ptr, src_value[, memory_order])
+    std::string dst_ptr = PrintExpr(op->args[0]);
+    std::string src_value = PrintExpr(op->args[1]);
+    this->PrintIndent();
+    this->stream << "AtomicMax(" << dst_ptr << ", " << src_value;
+    if (op->args.size() > 2) {
+      this->stream << ", " << PrintExpr(op->args[2]);
+    }
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::atomic_max_ret_elem_op())) {
+    // atomic_max_ret_elem_op(dst_ptr, src_value[, memory_order]) -> returns
+    // prev value
+    os << "AtomicMaxRet(" << PrintExpr(op->args[0]) << ", "
+       << PrintExpr(op->args[1]);
+    if (op->args.size() > 2) {
+      os << ", " << PrintExpr(op->args[2]);
+    }
+    os << ")";
+  } else if (op->op.same_as(tl::atomic_min_elem_op())) {
+    // atomic_min_elem_op(dst_ptr, src_value[, memory_order])
+    std::string dst_ptr = PrintExpr(op->args[0]);
+    std::string src_value = PrintExpr(op->args[1]);
+    this->PrintIndent();
+    this->stream << "AtomicMin(" << dst_ptr << ", " << src_value;
+    if (op->args.size() > 2) {
+      this->stream << ", " << PrintExpr(op->args[2]);
+    }
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::atomic_min_ret_elem_op())) {
+    // atomic_min_ret_elem_op(dst_ptr, src_value[, memory_order]) -> returns
+    // prev value
+    os << "AtomicMinRet(" << PrintExpr(op->args[0]) << ", "
+       << PrintExpr(op->args[1]);
+    if (op->args.size() > 2) {
+      os << ", " << PrintExpr(op->args[2]);
+    }
+    os << ")";
   } else {
     CodeGenC::VisitExpr_(op, os);
   }
@@ -1151,7 +1284,8 @@ inline void PrintConst(const FloatImmNode *op, std::ostream &os,
     os << "bfloat16_t";
     os << '(' << std::scientific << op->value << 'f' << ')';
     return;
-  } else if (op->dtype.is_float8_e4m3fnuz()) {
+  } else if (op->dtype.is_float8_e4m3fnuz() || op->dtype.is_float8_e4m3() ||
+             op->dtype.is_float8_e4m3fn()) {
     os << "fp8_e4_t";
     os << '(' << std::scientific << op->value << 'f' << ')';
     return;
@@ -1165,9 +1299,9 @@ inline void PrintConst(const FloatImmNode *op, std::ostream &os,
       if (op->value < 0) {
         temp << "-";
       }
-      temp << ((op->dtype.bits() == 32) ? "HIPRT_INF_F" : "HIPRT_INF");
+      temp << ((op->dtype.bits() == 32) ? "HUGE_VALF" : "HUGE_VAL");
     } else if (std::isnan(op->value)) {
-      temp << ((op->dtype.bits() == 32) ? "HIPRT_NAN_F" : "HIPRT_NAN");
+      temp << ((op->dtype.bits() == 32) ? "NAN" : "NAN");
     } else {
       temp << std::scientific << op->value;
       if (op->dtype.bits() == 32)
@@ -1284,9 +1418,15 @@ void CodeGenTileLangHIP::AddFunction(const PrimFunc &f) {
   ReserveKeywordsAsUnique();
 
   auto global_symbol = f->GetAttr<String>(tvm::attr::kGlobalSymbol);
-  ICHECK(global_symbol.defined())
+  ICHECK(global_symbol.has_value())
       << "CodeGenC: Expect PrimFunc to have the global_symbol attribute";
   bool no_alias = f->HasNonzeroAttr(tir::attr::kNoAlias);
+  std::unordered_set<const VarNode *> non_restrict;
+  if (auto opt =
+          f->GetAttr<ffi::Array<tir::Var>>(tl::attr::kNonRestrictParams)) {
+    for (const tir::Var &v : opt.value())
+      non_restrict.insert(v.get());
+  }
 
   this->PrintFuncPrefix(stream);
   CodeGenC::PrintType(f->ret_type, stream);
@@ -1321,7 +1461,7 @@ void CodeGenTileLangHIP::AddFunction(const PrimFunc &f) {
         }
       }
 
-      if (no_alias) {
+      if (no_alias && !non_restrict.count(v.get())) {
         PrintRestrict(v, stream);
       }
     } else {

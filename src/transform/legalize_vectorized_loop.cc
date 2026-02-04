@@ -22,6 +22,7 @@
  * \brief infer the fragment/shared memory layout
  */
 
+#include <tvm/ffi/reflection/registry.h>
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/op.h>
 #include <tvm/tir/stmt_functor.h>
@@ -72,7 +73,7 @@ private:
     // Change the loop kind from vectorized to serial
     for_node.CopyOnWrite()->kind = ForKind::kSerial;
     // Apply vectorization transformation to the loop
-    return VectorizeLoop(std::move(for_node));
+    return VectorizeLoop(for_node, analyzer_);
   }
 };
 
@@ -80,7 +81,7 @@ private:
 tvm::transform::Pass LegalizeVectorizedLoop() {
   using namespace tir::transform;
   // Define the transformation function to be applied
-  auto pass_func = [=](PrimFunc f, IRModule m, PassContext ctx) {
+  auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
     return LoopVectorizedLegalizer::Substitute(std::move(f));
   };
   // Create and return a PrimFunc pass with the transformation function
@@ -88,8 +89,11 @@ tvm::transform::Pass LegalizeVectorizedLoop() {
 }
 
 // Register the pass globally so it can be used in the compilation pipeline
-TVM_REGISTER_GLOBAL("tl.transform.LegalizeVectorizedLoop")
-    .set_body_typed(LegalizeVectorizedLoop);
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = tvm::ffi::reflection;
+  refl::GlobalDef().def("tl.transform.LegalizeVectorizedLoop",
+                        LegalizeVectorizedLoop);
+}
 
 } // namespace tl
 } // namespace tvm

@@ -9,10 +9,21 @@
 
 #include <tvm/arith/iter_affine_map.h>
 
+#include "../support/ffi_aliases.h"
+
 namespace tvm {
 namespace tl {
 
 using namespace tir;
+
+class NormalizeIterException : public std::exception {
+public:
+  const char *what() const noexcept override { return msg_.c_str(); }
+  NormalizeIterException(const std::string &msg) : msg_(msg) {}
+
+private:
+  std::string msg_;
+};
 
 /*!
  * \brief Collect the IterSplit that is not used in expr.

@@ -1,243 +1,429 @@
+# 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 # Learn a lot from the MLC - LLM Project
-# https: // github.com/mlc-ai/mlc-llm/blob/main/CMakeLists.txt
+# https://github.com/mlc-ai/mlc-llm/blob/main/CMakeLists.txt
 
-cmake_minimum_required(VERSION 3.18)
+cmake_minimum_required(VERSION 3.26)
 project(TILE_LANG C CXX)
 
-# Set default build type to Release if not provided
-if(NOT CMAKE_BUILD_TYPE)
-  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type")
-endif()
-
-# Define a custom macro for globbing files with conditional CONFIGURE_DEPENDS
-if(${CMAKE_VERSION} VERSION_GREATER_EQUAL "3.12.0")
-  macro(tilelang_file_glob glob variable)
-    file(${glob} ${variable} CONFIGURE_DEPENDS ${ARGN})
-  endmacro()
-else()
-  macro(tilelang_file_glob glob variable)
-    file(${glob} ${variable} ${ARGN})
-  endmacro()
-endif()
-
-# Handle TVM prebuild path or use default configuration
-if(DEFINED TVM_PREBUILD_PATH)
-  message(STATUS "TVM_PREBUILD_PATH: ${TVM_PREBUILD_PATH}")
-
-  if(EXISTS ${TVM_PREBUILD_PATH}/config.cmake)
-    include(${TVM_PREBUILD_PATH}/config.cmake)
-  endif()
-else()
-  if(EXISTS ${CMAKE_BINARY_DIR}/config.cmake)
-    include(${CMAKE_BINARY_DIR}/config.cmake)
-  elseif(EXISTS ${CMAKE_SOURCE_DIR}/config.cmake)
-    include(${CMAKE_SOURCE_DIR}/config.cmake)
-  endif()
-
-  # Set default build type to RelWithDebInfo if not provided
-  if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
-    message(STATUS "Setting default build type to ${CMAKE_BUILD_TYPE}")
-  endif()
-endif()
-
-# include cmake modules
-include(CheckCXXCompilerFlag)
-
-# Enable static runtime build if required
-if(TILE_LANG_INSTALL_STATIC_LIB)
-  set(BUILD_STATIC_RUNTIME ON)
-endif()
-
-# Enforce CUDA standard
-if(USE_CUDA)
-  set(CMAKE_CUDA_STANDARD 17)
-endif()
-
-# Enforce HIP standard
-if(USE_ROCM)
-  set(CMAKE_HIP_STANDARD 17)
-  check_cxx_compiler_flag("-std=c++17" SUPPORT_CXX17)
-  set(CMAKE_CXX_FLAGS "-D__HIP_PLATFORM_AMD__ ${CMAKE_CXX_FLAGS}")
-endif()
-
-# Enforce C++ standard
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Locate TVM prebuild path
-if(NOT DEFINED TVM_PREBUILD_PATH)
-  if(DEFINED ENV{TVM_PREBUILD_PATH})
-    set(TVM_PREBUILD_PATH "$ENV{TVM_PREBUILD_PATH}")
-  endif()
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND "$ENV{CIBUILDWHEEL}")
+  # Warning came from tvm submodule
+  string(APPEND CMAKE_CXX_FLAGS " -Wno-dangling-reference")
 endif()
 
-# Locate TVM source directory
-if(NOT DEFINED TVM_SOURCE_DIR)
-  if(DEFINED ENV{TVM_SOURCE_DIR})
-    set(TVM_SOURCE_DIR "$ENV{TVM_SOURCE_DIR}")
-  elseif(DEFINED TVM_PREBUILD_PATH)
-    set(TVM_SOURCE_DIR "${TVM_PREBUILD_PATH}/..")
+set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.gitmodules" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+  find_package(Git QUIET)
+  if(Git_FOUND)
+    execute_process(
+      COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      RESULT_VARIABLE TILELANG_GIT_SUBMODULE_RESULT
+    )
+    if(NOT TILELANG_GIT_SUBMODULE_RESULT EQUAL 0)
+      message(
+        FATAL_ERROR
+          "Failed to initialize git submodules. Please run "
+          "`git submodule update --init --recursive` and re-run CMake."
+      )
+    endif()
   else()
-    set(TVM_SOURCE_DIR ${PROJECT_SOURCE_DIR}/3rdparty/tvm)
+    message(
+      FATAL_ERROR
+        "Git is required to initialize TileLang submodules. "
+        "Please install git or fetch the submodules manually."
+    )
   endif()
 endif()
 
-# Handle TVM prebuild or build TVM from source
-if(DEFINED TVM_PREBUILD_PATH)
-  message(STATUS "Using prebuilt TVM from ${TVM_PREBUILD_PATH}")
-  add_library(tvm SHARED IMPORTED)
-  set_target_properties(tvm PROPERTIES
-    IMPORTED_LOCATION "${TVM_PREBUILD_PATH}/libtvm.so"
-    INTERFACE_INCLUDE_DIRECTORIES "${TVM_PREBUILD_PATH}/../include"
-  )
-  add_library(tvm_runtime SHARED IMPORTED)
-  set_target_properties(tvm_runtime PROPERTIES
-    IMPORTED_LOCATION "${TVM_PREBUILD_PATH}/libtvm_runtime.so"
-    INTERFACE_INCLUDE_DIRECTORIES "${TVM_PREBUILD_PATH}/../include"
-  )
+find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
+  message(STATUS "Using ccache: ${CCACHE_PROGRAM} with base_dir=${CMAKE_SOURCE_DIR}")
+  if(APPLE)
+    # Passing configs like `ccache base_dir=/xxx cc ...` is supported
+    # (likely) since ccache 4.x, which has been provided by homebrew.
+    # Our Linux builder image (manylinux2014 & manylinux_2_28) still
+    # provides ccache 3.x and do not support this form.
+    # `cibuildwheel` uses fixed folder on Linux (`/project`) as working directory,
+    # so cache would work without setting `base_dir`.
+    set(CCACHE_PROGRAM "${CCACHE_PROGRAM};base_dir=${CMAKE_SOURCE_DIR}")
+  endif()
+  set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}" CACHE STRING "C compiler launcher")
+  set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}" CACHE STRING "CXX compiler launcher")
+  set(CMAKE_CUDA_COMPILER_LAUNCHER "${CCACHE_PROGRAM}" CACHE STRING "CUDA compiler launcher")
 else()
-  message(STATUS "Building TVM from source at ${TVM_SOURCE_DIR}")
-  add_subdirectory(${TVM_SOURCE_DIR} tvm EXCLUDE_FROM_ALL)
+  find_program(SCCACHE_PROGRAM sccache)
+  if(SCCACHE_PROGRAM)
+    message(STATUS "Using sccache: ${SCCACHE_PROGRAM}")
+    set(CMAKE_C_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}" CACHE STRING "C compiler launcher")
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}" CACHE STRING "CXX compiler launcher")
+    set(CMAKE_CUDA_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}" CACHE STRING "CUDA compiler launcher")
+  endif()
 endif()
+
+# Configs
+set(TILELANG_BACKENDS CUDA ROCM METAL)
+
+set(TILELANG_BACKEND_DOC_CUDA "Enable CUDA backend (ON/OFF/or CUDA SDK path)")
+set(TILELANG_BACKEND_DOC_ROCM "Enable ROCm backend (ON/OFF/or ROCm SDK path)")
+set(TILELANG_BACKEND_DOC_METAL "Enable Metal backend")
+
+# TVM's config.cmake redefines USE_* options later, so we cache the user's choice
+# (including explicit -DUSE_XXX arguments) before we include TVM and restore it
+# afterwards.
+
+macro(tilelang_define_backend_option BACKEND)
+  set(_backend_var "USE_${BACKEND}")
+  set(_doc "${TILELANG_BACKEND_DOC_${BACKEND}}")
+  set(_user_override_var "TILELANG_USER_OVERRIDE_${_backend_var}")
+
+  set(_user_override OFF)
+  if(DEFINED ${_user_override_var})
+    set(_user_override "${${_user_override_var}}")
+  endif()
+
+  if(DEFINED CACHE{${_backend_var}})
+    get_property(_cache_type CACHE ${_backend_var} PROPERTY TYPE)
+    if(_cache_type STREQUAL "UNINITIALIZED")
+      set(_user_override ON)
+    endif()
+  endif()
+
+  set(_default OFF)
+  if(DEFINED ${_backend_var})
+    set(_default "${${_backend_var}}")
+  endif()
+
+  option(${_backend_var} "${_doc}" "${_default}")
+  # Remember if the user explicitly set this option so that later logic
+  # won't auto-toggle backends they configured on the command line.
+  set(${_user_override_var} ${_user_override} CACHE INTERNAL
+    "User explicitly set ${_backend_var} during configuration" FORCE)
+  set(TILELANG_OPTION_${_backend_var} "${${_backend_var}}")
+endmacro()
+
+foreach(BACKEND IN LISTS TILELANG_BACKENDS)
+  tilelang_define_backend_option(${BACKEND})
+endforeach()
+
+set(PREBUILD_CYTHON ON)
+# Configs end
+
+include(cmake/load_tvm.cmake)
+
+if(EXISTS ${TVM_SOURCE}/cmake/config.cmake)
+  include(${TVM_SOURCE}/cmake/config.cmake)
+else()
+  message(FATAL_ERROR "Nor tvm provided or submodule checkout-ed.")
+endif()
+# Re-apply TileLang's preferred backend settings after TVM's config may have
+# overridden the USE_* cache entries.
+foreach(BACKEND IN LISTS TILELANG_BACKENDS)
+  set(_backend_var "USE_${BACKEND}")
+  set(_doc "${TILELANG_BACKEND_DOC_${BACKEND}}")
+  set(${_backend_var} ${TILELANG_OPTION_${_backend_var}} CACHE STRING "${_doc}" FORCE)
+  set(${_backend_var} ${TILELANG_OPTION_${_backend_var}})
+endforeach()
+
+# Include directories for TileLang
+set(TILE_LANG_INCLUDES ${TVM_INCLUDES})
 
 # Collect source files
-tilelang_file_glob(GLOB TILE_LANG_SRCS
+file(GLOB TILE_LANG_SRCS
   src/*.cc
   src/layout/*.cc
   src/transform/*.cc
+  src/transform/common/*.cc
   src/op/*.cc
   src/target/utils.cc
+  src/target/codegen_c_host.cc
   src/target/codegen_cpp.cc
   src/target/rt_mod_cpp.cc
-  # webgpu doesn't have system dependency
-  src/target/codegen_webgpu.cc
+  # intrin_rule doesn't have system dependency
+  src/target/intrin_rule*.cc
 )
 
-# Include CUDA source files if CUDA is enabled
-if(USE_CUDA)
-  tilelang_file_glob(GLOB TILE_LANG_CUDA_SRCS
-    src/runtime/*.cc
-    src/target/codegen_cuda.cc
-    src/target/rt_mod_cuda.cc
-  )
-  list(APPEND TILE_LANG_SRCS ${TILE_LANG_CUDA_SRCS})
+# Always include CPU-safe runtime helpers
+list(APPEND TILE_LANG_SRCS
+  src/runtime/error_helpers.cc
+)
+
+# Track if the user explicitly selected a backend via cache options.
+set(TILELANG_BACKEND_USER_SELECTED OFF)
+foreach(BACKEND IN LISTS TILELANG_BACKENDS)
+  set(_backend_var "USE_${BACKEND}")
+  set(_override_var "TILELANG_USER_OVERRIDE_${_backend_var}")
+  if(${_backend_var} OR ${_override_var})
+    set(TILELANG_BACKEND_USER_SELECTED ON)
+  endif()
+endforeach()
+
+# Only auto-select a backend when the user didn't specify one explicitly.
+if(NOT TILELANG_BACKEND_USER_SELECTED)
+  if($ENV{USE_METAL})
+    set(USE_METAL ON)
+  elseif(APPLE)
+    message(STATUS "Enable Metal support by default.")
+    set(USE_METAL ON)
+  elseif($ENV{USE_ROCM})
+    set(USE_ROCM ON)
+  elseif($ENV{USE_MACA})
+    set(USE_MACA ON)
+  else()
+    if($ENV{USE_CUDA})
+      set(USE_CUDA ON)
+    elseif(DEFINED ENV{USE_CUDA} AND NOT $ENV{USE_CUDA})
+      # Build CPU-only when we explicitly disable CUDA
+      set(USE_CUDA OFF)
+    else()
+      message(STATUS "Enable CUDA support by default.")
+      set(USE_CUDA ON)
+    endif()
+  endif()
 endif()
 
-# Include ROCm source files if ROCm is enabled
-if(USE_ROCM)
-  tilelang_file_glob(GLOB TILE_LANG_HIP_SRCS
+if(USE_METAL)
+  file(GLOB TILE_LANG_METAL_SRCS
+    src/target/rt_mod_metal.cc
+  )
+  list(APPEND TILE_LANG_SRCS ${TILE_LANG_METAL_SRCS})
+  # FIXME: CIBW failed with backtrace, why???
+  set(TVM_FFI_USE_LIBBACKTRACE OFF)
+elseif(USE_ROCM)
+  set(CMAKE_HIP_STANDARD 17)
+  include(${TVM_SOURCE}/cmake/utils/FindROCM.cmake)
+  find_rocm(${USE_ROCM})
+  add_compile_definitions(__HIP_PLATFORM_AMD__ __HIP_PLATFORM_HCC__=1)
+
+  file(GLOB TILE_LANG_HIP_SRCS
     src/target/codegen_hip.cc
     src/target/rt_mod_hip.cc
   )
   list(APPEND TILE_LANG_SRCS ${TILE_LANG_HIP_SRCS})
-endif()
+  list(APPEND TILE_LANG_INCLUDES ${ROCM_INCLUDE_DIRS})
+elseif(USE_CUDA)
+  set(CMAKE_CUDA_STANDARD 17)
+  find_package(CUDAToolkit REQUIRED)
+  set(CMAKE_CUDA_COMPILER "${CUDAToolkit_BIN_DIR}/nvcc")
+  add_compile_definitions("CUDA_MAJOR_VERSION=${CUDAToolkit_VERSION_MAJOR}")
 
-# Include MACA source files if MACA is enabled
-if(USE_MACA)
-  include_directories(SYSTEM $ENV{MACA_PATH}/include)
-  tilelang_file_glob(GLOB TILE_LANG_MACA_SRCS
+  # Set `USE_CUDA=/usr/local/cuda-x.y`
+  cmake_path(GET CUDAToolkit_BIN_DIR PARENT_PATH USE_CUDA)
+
+  # ============================================================================
+  # CUDA Driver Stub Library (libcuda_stub.so)
+  # ============================================================================
+  # This library provides drop-in replacements for CUDA driver API functions.
+  # Instead of linking directly against libcuda.so (which would fail on
+  # CPU-only machines), we link against this stub which loads libcuda.so
+  # lazily at runtime on first API call.
+  #
+  # The stub exports global C functions matching the CUDA driver API:
+  #   - cuModuleLoadData, cuLaunchKernel, cuMemsetD32_v2, etc.
+  # These can be called directly without any wrapper macros.
+  # ============================================================================
+  add_library(cuda_stub SHARED src/target/stubs/cuda.cc)
+  target_include_directories(cuda_stub PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+  # Export symbols with visibility="default" when building
+  target_compile_definitions(cuda_stub PRIVATE TILELANG_CUDA_STUB_EXPORTS)
+  # Use dlopen/dlsym for runtime library loading
+  target_link_libraries(cuda_stub PRIVATE ${CMAKE_DL_LIBS})
+  set_target_properties(cuda_stub PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    # Use consistent naming
+    OUTPUT_NAME "cuda_stub"
+  )
+
+  file(GLOB TILE_LANG_CUDA_SRCS
+    src/runtime/runtime.cc
+    src/target/ptx.cc
+    src/target/codegen_cuda.cc
+    src/target/codegen_py.cc
+    src/target/codegen_utils.cc
+    src/target/codegen_cutedsl.cc
+    src/target/rt_mod_cuda.cc
+    src/target/rt_mod_cutedsl.cc
+  )
+  list(APPEND TILE_LANG_SRCS ${TILE_LANG_CUDA_SRCS})
+
+  list(APPEND TILE_LANG_INCLUDES ${CUDAToolkit_INCLUDE_DIRS})
+elseif(USE_MACA)
+  include(${TVM_SOURCE}/cmake/utils/FindMACA.cmake)
+  find_maca(${USE_MACA})
+  file(GLOB TILE_LANG_MACA_SRCS
+    src/target/ptx.cc
     src/target/codegen_maca.cc
     src/target/rt_mod_maca.cc
   )
   list(APPEND TILE_LANG_SRCS ${TILE_LANG_MACA_SRCS})
+  list(APPEND TILE_LANG_INCLUDES ${MACA_INCLUDE_DIRS})
 endif()
 
-message(STATUS "Collected source files: ${TILE_LANG_SRCS}")
+set(USE_Z3      ON CACHE STRING "Use Z3 SMT solver for TileLang optimizations")
+set(USE_PYPI_Z3 ON CACHE BOOL   "Use Z3 provided by PyPI z3-solver package")
 
-# Add TileLang object library
+if(USE_Z3 AND USE_PYPI_Z3)
+  list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake/pypi-z3")
+  find_package(Z3 REQUIRED)
+endif()
+
+# Include tvm after configs have been populated
+add_subdirectory(${TVM_SOURCE} tvm EXCLUDE_FROM_ALL)
+
+# Resolve compile warnings in tvm
+add_compile_definitions(DMLC_USE_LOGGING_LIBRARY=<tvm/runtime/logging.h>)
+
 add_library(tilelang_objs OBJECT ${TILE_LANG_SRCS})
 
-message(STATUS "TVM_SOURCE_DIR: ${TVM_SOURCE_DIR}")
-# Include directories for TileLang
-set(TILE_LANG_INCLUDES
-  ${TVM_SOURCE_DIR}/include
-  ${TVM_SOURCE_DIR}/src
-  ${TVM_SOURCE_DIR}/3rdparty/dlpack/include
-  ${TVM_SOURCE_DIR}/3rdparty/dmlc-core/include
-)
-
-# Find CUDA Toolkit
-if(USE_CUDA)
-  find_package(CUDAToolkit REQUIRED)
-
-  if(NOT CUDAToolkit_FOUND)
-    message(FATAL_ERROR "CUDA Toolkit not found. Please set CUDAToolkit_ROOT.")
-  endif()
-
-  message(STATUS "CUDA Toolkit includes: ${CUDAToolkit_INCLUDE_DIRS}")
-  set(CUDA_MAJOR_VERSION ${CUDAToolkit_VERSION_MAJOR})
-  message(STATUS "Setting CUDA_MAJOR_VERSION=${CUDA_MAJOR_VERSION}")
-  add_compile_definitions(CUDA_MAJOR_VERSION=${CUDA_MAJOR_VERSION})
-  
-  list(APPEND TILE_LANG_INCLUDES ${CUDAToolkit_INCLUDE_DIRS})
-endif(USE_CUDA)
-
-# Find ROCM Toolkit
-if(USE_ROCM)
-  find_rocm(${USE_ROCM})
-  message(STATUS "USE_ROCM: ${USE_ROCM}")
-
-  if(ROCM_FOUND)
-    # always set the includedir
-    # avoid global retrigger of cmake
-    include_directories(SYSTEM ${ROCM_INCLUDE_DIRS})
-    add_definitions(-D__HIP_PLATFORM_HCC__=1)
-  else()
-    message(FATAL_ERROR "ROCM Toolkit not found. Please set HIP_ROOT.")
-  endif(ROCM_FOUND)
-
-  message(STATUS "ROCM Toolkit includes: ${ROCM_INCLUDE_DIRS}")
-  list(APPEND TILE_LANG_INCLUDES ${ROCM_INCLUDE_DIRS})
-endif(USE_ROCM)
-
-# Define compile-time macros
-set(TILE_LANG_COMPILE_DEFS
-  DMLC_USE_LOGGING_LIBRARY=<tvm/runtime/logging.h>
-  __STDC_FORMAT_MACROS=1
-  PICOJSON_USE_INT64
-)
-
-# Set target properties for object library
-target_include_directories(tilelang_objs PRIVATE ${TILE_LANG_INCLUDES})
-target_compile_definitions(tilelang_objs PRIVATE ${TILE_LANG_COMPILE_DEFS})
-target_compile_definitions(tilelang_objs PRIVATE -DTILE_LANG_EXPORTS)
-
-# Shared library
-add_library(tilelang SHARED $<TARGET_OBJECTS:tilelang_objs>)
-target_link_libraries(tilelang PUBLIC tvm_runtime)
-
-# Static library
-add_library(tilelang_static STATIC $<TARGET_OBJECTS:tilelang_objs>)
-add_dependencies(tilelang_static tvm_runtime)
-set_target_properties(tilelang_static PROPERTIES OUTPUT_NAME tilelang)
-
-# Debug build type-specific definitions
+# Set debug mode compile definitions
+# Enable the TVM debug option, i.e., TVM_LOG_DEBUG
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-  target_compile_definitions(tilelang PRIVATE "TVM_LOG_DEBUG")
+  message(STATUS "Building TileLang with DEBUG mode")
   target_compile_definitions(tilelang_objs PRIVATE "TVM_LOG_DEBUG")
-  target_compile_definitions(tilelang_static PRIVATE "TVM_LOG_DEBUG")
 endif()
 
-# Module shared library
+target_include_directories(tilelang_objs PRIVATE ${TILE_LANG_INCLUDES})
+
+add_library(tilelang SHARED $<TARGET_OBJECTS:tilelang_objs>)
 add_library(tilelang_module SHARED $<TARGET_OBJECTS:tilelang_objs>)
+target_link_libraries(tilelang PUBLIC tvm_runtime tvm)
 target_link_libraries(tilelang_module PUBLIC tvm)
 
-# Install targets
-if(TILE_LANG_INSTALL_STATIC_LIB)
-  install(TARGETS tilelang_static tvm_runtime
-    LIBRARY DESTINATION lib${LIB_SUFFIX}
-  )
-else()
-  if(DEFINED TVM_PREBUILD_PATH)
-    install(TARGETS tilelang tilelang_module
-      RUNTIME DESTINATION bin
-      LIBRARY DESTINATION lib${LIB_SUFFIX}
-    )
+# Place dev build outputs under build/lib for consistency
+set_target_properties(tilelang PROPERTIES
+  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+  ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+)
+set_target_properties(tilelang_module PROPERTIES
+  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+  ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+)
+# Build cython extension
+find_package(Python REQUIRED COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT})
+
+add_custom_command(
+  OUTPUT "${CMAKE_BINARY_DIR}/tilelang_cython_wrapper.cpp"
+  COMMENT
+    "Cythoning tilelang/jit/adapter/cython/cython_wrapper.pyx"
+  COMMAND Python::Interpreter -m cython
+          "${CMAKE_CURRENT_SOURCE_DIR}/tilelang/jit/adapter/cython/cython_wrapper.pyx"
+          --module-name tilelang_cython_wrapper
+          --cplus --output-file "${CMAKE_BINARY_DIR}/tilelang_cython_wrapper.cpp"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tilelang/jit/adapter/cython/cython_wrapper.pyx"
+  VERBATIM)
+
+if(NOT "${SKBUILD_SABI_VERSION}" STREQUAL "")
+  set(USE_SABI USE_SABI ${SKBUILD_SABI_VERSION})
+endif()
+
+python_add_library(tilelang_cython_wrapper MODULE "${CMAKE_BINARY_DIR}/tilelang_cython_wrapper.cpp" ${USE_SABI} WITH_SOABI)
+
+# Ensure dev builds drop the extension into build/lib alongside other shared libs
+set_target_properties(tilelang_cython_wrapper PROPERTIES
+  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+  ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+)
+
+# Install the extension into tilelang/lib inside the wheel
+install(TARGETS tilelang_cython_wrapper
+        LIBRARY DESTINATION tilelang/lib
+        RUNTIME DESTINATION tilelang/lib
+        ARCHIVE DESTINATION tilelang/lib)
+
+# Copy libz3.so to build folder to workaround isolated build env issue
+if(USE_Z3 AND USE_PYPI_Z3)
+  get_target_property(Z3_LIBRARY_PATH z3::libz3 IMPORTED_LOCATION)
+  install(FILES "${Z3_LIBRARY_PATH}" DESTINATION "${CMAKE_BINARY_DIR}/lib")
+  if(APPLE)
+    set_target_properties(tvm PROPERTIES BUILD_RPATH "@loader_path")
   else()
-    install(TARGETS tvm_runtime tilelang tilelang_module
-      RUNTIME DESTINATION bin
-      LIBRARY DESTINATION lib${LIB_SUFFIX}
-    )
+    set_target_properties(tvm PROPERTIES BUILD_RPATH "\$ORIGIN")
   endif()
 endif()
+
+set(TILELANG_OUTPUT_TARGETS
+  tilelang
+  tilelang_module
+  tvm
+  tvm_runtime
+)
+
+if(USE_CUDA)
+  # Link against CUDA stub library instead of libcuda.so
+  # This enables lazy loading of libcuda.so at runtime, allowing
+  # `import tilelang` to succeed on CPU-only machines.
+  foreach(target IN LISTS TILELANG_OUTPUT_TARGETS)
+    target_link_libraries(${target} PUBLIC cuda_stub)
+  endforeach()
+  # Include CUDA stub in output targets for RPATH configuration
+  list(APPEND TILELANG_OUTPUT_TARGETS cuda_stub)
+endif()
+
+unset(PATCHELF_EXECUTABLE CACHE)
+
+if(APPLE)
+  set(TILELANG_INSTALL_RPATH "@loader_path;@loader_path/../../tvm_ffi/lib")
+  if(USE_Z3 AND USE_PYPI_Z3)
+    # Some z3 is placed in lib/ and some in bin/, we add both in rpath
+    string(APPEND TILELANG_INSTALL_RPATH ";@loader_path/../../z3/lib;@loader_path/../../z3/bin")
+  endif()
+elseif(UNIX)
+  set(TILELANG_INSTALL_RPATH "\$ORIGIN:\$ORIGIN/../../tvm_ffi/lib")
+  if(USE_Z3 AND USE_PYPI_Z3)
+    string(APPEND TILELANG_INSTALL_RPATH ":\$ORIGIN/../../z3/lib")
+  endif()
+  if(USE_CUDA)
+    string(APPEND TILELANG_INSTALL_RPATH ":\$ORIGIN/../../nvidia/cu${CUDAToolkit_VERSION_MAJOR}/lib")
+  endif()
+  find_program(PATCHELF_EXECUTABLE patchelf)
+  if (NOT PATCHELF_EXECUTABLE)
+    message(STATUS "`patchelf` not found.")
+  endif()
+endif()
+
+# Let libtilelang search for tvm/tvm_runtime in the same directory
+foreach(target IN LISTS TILELANG_OUTPUT_TARGETS)
+  set_target_properties(${target} PROPERTIES INSTALL_RPATH "${TILELANG_INSTALL_RPATH}")
+  set_target_properties(${target} PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+  )
+endforeach()
+
+# Exclude libcuda.so to allow importing on a CPU-only machine
+if(USE_CUDA AND PATCHELF_EXECUTABLE)
+  # Run `patchelf` on built libraries to remove libcuda.so dependency.
+  # Use `install(CODE ...)` instead of `add_custom_command(... POST_BUILD ...)`
+  # to avoid race conditions during linking.
+  foreach(target IN LISTS TILELANG_OUTPUT_TARGETS)
+    install(CODE "
+      execute_process(
+        COMMAND ${PATCHELF_EXECUTABLE} --remove-needed libcuda.so.1 --remove-needed libcuda.so \"$<TARGET_FILE:${target}>\"
+        WORKING_DIRECTORY \"${CMAKE_INSTALL_PREFIX}\"
+        RESULT_VARIABLE patchelf_result
+      )
+      if(patchelf_result EQUAL 0)
+        message(STATUS \"`patchelf` successfully removed dependency `libcuda.so` from $<TARGET_FILE:${target}>\")
+      else()
+        message(WARNING \"`patchelf` failed to remove dependency `libcuda.so` from $<TARGET_FILE:${target}>\")
+      endif()
+    ")
+  endforeach()
+endif()
+
+install(
+  TARGETS ${TILELANG_OUTPUT_TARGETS}
+  LIBRARY DESTINATION tilelang/lib
+  RUNTIME DESTINATION tilelang/lib
+  ARCHIVE DESTINATION tilelang/lib
+)

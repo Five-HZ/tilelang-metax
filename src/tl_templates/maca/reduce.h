@@ -24,28 +24,29 @@ struct MinOp {
   }
 };
 
-template <class Reducer, int threads, int scale> struct AllReduce {
+template <class Reducer, int threads, int scale, int thread_offset = 0,
+          int all_threads = threads>
+struct AllReduce {
   static_assert(threads == 1024 || threads == 512 || threads == 256 ||
                 threads == 128 || threads == 64 || threads == 32 ||
                 threads == 16 || threads == 8 || threads == 4 || threads == 2);
   static_assert(threads % scale == 0);
-
   template <typename T> static __device__ T run(T x, T *red_buf = nullptr) {
     constexpr int offset = threads / 2;
     constexpr int warpSize = 64;
-
     if constexpr (offset >= warpSize) {
       __syncthreads();
-      red_buf[threadIdx.x] = x;
+      red_buf[threadIdx.x - thread_offset] = x;
       __syncthreads();
-      x = Reducer()(x, red_buf[threadIdx.x ^ offset]);
+      x = Reducer()(x, red_buf[(threadIdx.x - thread_offset) ^ offset]);
     } else {
-      x = Reducer()(x, __shfl_xor(x, offset));
+      x = Reducer()(x, tl::shfl_xor_sync(uint64_t(-1), x, offset));
     }
     if constexpr (offset == scale) {
       return x;
     } else {
-      return AllReduce<Reducer, offset, scale>::run(x, red_buf);
+      return AllReduce<Reducer, offset, scale, thread_offset, all_threads>::run(
+          x, red_buf);
     }
   }
 };

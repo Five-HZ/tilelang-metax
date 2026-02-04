@@ -2,6 +2,7 @@
 *.slo
 *.lo
 *.o
+*.so
 *.obj
 *.pyc
 
@@ -18,7 +19,8 @@
 
 debug/
 build/
-dist/
+*dist/
+dist*/
 wheelhouse/
 __pycache__
 nnfusion.tar.gz
@@ -26,7 +28,14 @@ nnfusion.tar.gz
 # makeenv and test intermediate files
 tmp/
 
+.env
+.envrc
+.venv
+env/
 venv/
+ENV/
+env.bak/
+venv.bak/
 .vscode/
 .vs/
 
@@ -75,20 +84,42 @@ models/frozenmodels/
 # .ruff_cache
 .ruff_cache
 
-# build sdist
-build_sdist/
-
 # exclude debug testing folder
 !testing/python/debug
 
 # ignore lib with develop mode
 tilelang/lib
 
-# tox
-.tox/
-
 # cython
 tilelang/jit/adapter/cython/.cycache
 
 # cache directory for clangd
 .cache/
+
+# claude
+**/.claude
+
+# CMake
+cmake-build/
+cmake-build-*/
+
+# Git version for sdist
+.git_commit.txt
+
+# pre-commit cache
+.pre-commit-cache/*
+
+# host checks logs
+maint/host_checks/logs/*
+
+# ncu
+*.ncu-rep
+
+# csv
+*.csv
+
+# clang-tidy
+/run-clang-tidy.py
+
+# perf regression test
+.perf_regression/

@@ -23,20 +23,29 @@
  * memory allocation. This pass merges multiple TIR-level dynamic or static
  * shared memory allocations into one allocation.
  */
+#include <tvm/ffi/function.h>
+#include <tvm/ffi/reflection/registry.h>
 #include <tvm/runtime/logging.h>
-#include <tvm/runtime/registry.h>
 #include <tvm/tir/expr.h>
 #include <tvm/tir/op.h>
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
+#include <algorithm>
+#include <functional>
+#include <limits>
+#include <optional>
+#include <queue>
+#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 #include "../op/builtin.h"
+#include "../target/utils.h"
 #include "runtime/thread_storage_scope.h"
-#include "support/arena.h"
 #include "tir/transforms/ir_utils.h"
+#include "tvm/tir/function.h"
 
 namespace tvm {
 namespace tl {
@@ -48,16 +57,16 @@ using runtime::StorageScope;
 
 static bool IsDynamicSharedMemory(Var buffer_var) {
   StorageScope storage_scope =
-      runtime::StorageScope::Create(GetPtrStorageScope(buffer_var));
+      runtime::StorageScope::Create(GetPtrStorageScope(std::move(buffer_var)));
   return storage_scope.rank == runtime::StorageRank::kShared &&
          storage_scope.tag == ".dyn";
 }
 
 static bool IsStaticSharedMemory(Var buffer_var) {
   StorageScope storage_scope =
-      runtime::StorageScope::Create(GetPtrStorageScope(buffer_var));
+      runtime::StorageScope::Create(GetPtrStorageScope(std::move(buffer_var)));
   return storage_scope.rank == runtime::StorageRank::kShared &&
-         storage_scope.tag == "";
+         storage_scope.tag.empty();
 }
 
 /*!
@@ -95,13 +104,15 @@ public:
 //
 class SharedMemLinearAccessPatternFinder final : public StmtExprVisitor {
 public:
-  explicit SharedMemLinearAccessPatternFinder(bool is_dynamic = true,
-                                              bool verbose = false)
-      : is_dynamic_(is_dynamic), verbose_(verbose) {}
+  explicit SharedMemLinearAccessPatternFinder(
+      bool is_dynamic = true, bool enable_aggressive_merge = false,
+      bool verbose = false)
+      : is_dynamic_(is_dynamic),
+        enable_aggressive_merge_(enable_aggressive_merge), verbose_(verbose) {}
   /*! \brief record the touch list of statement. */
   struct StmtEntry {
     // The statement
-    const Object *stmt;
+    const Object *stmt{};
     // The index in the linear_seq_ to point to end of the nested scope.
     // This is only set to non-zero if stmt is a nested scope.
     // if offset > 0, means this is the begin, the end entry is current_index +
@@ -135,6 +146,8 @@ public:
   void VisitStmt_(const AllocateNode *op) final {
     size_t level = scope_.size();
     const VarNode *buf = op->buffer_var.get();
+    // Record the allocation site and depth so liveness can reason about the
+    // original scope.
     alloc_info_[buf].alloc = op;
     alloc_info_[buf].level = level;
     StmtExprVisitor::VisitStmt_(op);
@@ -149,13 +162,20 @@ public:
     auto it = alloc_info_.find(buf);
     if (it != alloc_info_.end() && it->second.alloc) {
       ICHECK_LT(it->second.level, scope_.size());
-      if (IsAppropriateSharedMemory(GetRef<Var>(buf))) {
-        scope_[scope_.size() - 1].touched.push_back(buf);
+      if (IsAppropriateSharedMemory(tvm::ffi::GetRef<Var>(buf))) {
+        // set into scope_.size() - 1 for aggressive memory reuse
+        auto enable_aggressive_merge = enable_aggressive_merge_;
+        if (enable_aggressive_merge) {
+          scope_[scope_.size() - 1].touched.push_back(buf);
+        } else {
+          scope_[it->second.level].touched.push_back(buf);
+        }
       }
     }
+
     StmtEntry e = scope_.back();
     scope_.pop_back();
-    if (e.touched.size() != 0) {
+    if (!e.touched.empty()) {
       e.stmt = op;
       UpdateStmtAttr(op, scope_level_);
       linear_seq_.push_back(e);
@@ -168,7 +188,7 @@ public:
     StmtExprVisitor::VisitStmt_(op);
     StmtEntry e = scope_.back();
     scope_.pop_back();
-    if (e.touched.size() != 0) {
+    if (!e.touched.empty()) {
       e.stmt = op;
       UpdateStmtAttr(op, scope_level_);
       linear_seq_.push_back(e);
@@ -181,10 +201,26 @@ public:
     const VarNode *buf = op->buffer->data.get();
     auto it = alloc_info_.find(buf);
     if (it != alloc_info_.end() && it->second.alloc) {
-      ICHECK_LT(it->second.level, scope_.size())
+      // Earlier we required `alloc_level < scope_.size()`, assuming every load
+      // would occur strictly inside a nested scope.  In practice the lowering
+      // pipeline may materialise reads in the very same frame that owns the
+      // allocation (e.g. when the buffer value is passed directly to a call),
+      // which used to trigger the CHECK.  Treat same-level accesses as valid so
+      // the merged allocator can reason about their lifetime correctly.
+      ICHECK_LE(it->second.level, scope_.size())
           << "Load memory in places other than store.";
-      if (IsAppropriateSharedMemory(GetRef<Var>(buf))) {
-        scope_[scope_.size() - 1].touched.push_back(buf);
+      if (IsAppropriateSharedMemory(tvm::ffi::GetRef<Var>(buf))) {
+        auto enable_aggressive_merge = enable_aggressive_merge_;
+        if (enable_aggressive_merge) {
+          scope_[scope_.size() - 1].touched.push_back(buf);
+        } else {
+          // When the access happens in the same scope frame as the allocation
+          // we attribute it to that frame instead of the outer parent.  This
+          // keeps the liveness window tight while still accounting for nested
+          // scopes that legitimately touch the buffer deeper in the tree.
+          size_t access_level = std::min(it->second.level, scope_.size() - 1);
+          scope_[access_level].touched.push_back(buf);
+        }
       }
     }
   }
@@ -193,9 +229,20 @@ public:
     // Directly reference to the variable count as a read.
     auto it = alloc_info_.find(buf);
     if (it != alloc_info_.end() && it->second.alloc) {
-      ICHECK_LT(it->second.level, scope_.size());
-      if (IsAppropriateSharedMemory(GetRef<Var>(buf))) {
-        scope_[scope_.size() - 1].touched.push_back(buf);
+      // Same rationale as the BufferLoad path above: direct references can be
+      // emitted at the allocation level after flattening, so accept them and
+      // record the touch for liveness planning.
+      ICHECK_LE(it->second.level, scope_.size());
+      if (IsAppropriateSharedMemory(tvm::ffi::GetRef<Var>(buf))) {
+        auto enable_aggressive_merge = enable_aggressive_merge_;
+        if (enable_aggressive_merge) {
+          scope_[scope_.size() - 1].touched.push_back(buf);
+        } else {
+          // Attribute same-level uses to the allocation frame, mirroring the
+          // BufferLoad handling to keep reuse decisions consistent.
+          size_t access_level = std::min(it->second.level, scope_.size() - 1);
+          scope_[access_level].touched.push_back(buf);
+        }
       }
     }
   }
@@ -214,6 +261,8 @@ public:
     scope_.pop_back();
     int64_t end_index = static_cast<int64_t>(linear_seq_.size());
     ICHECK_GT(end_index, begin_index);
+    // The paired entries serve as scope sentinels once we flatten the
+    // control-flow tree.
     e.scope_pair_offset = begin_index - end_index;
     linear_seq_.push_back(e);
     // record the pointer to end index.
@@ -234,7 +283,9 @@ public:
     } else if (op->attr_key == "kWarpSpecializationScope") {
       IfThenElse body = Downcast<IfThenElse>(op->body);
       this->VisitStmt(body->then_case);
-      this->VisitStmt(body->else_case.value());
+      if (body->else_case.defined()) {
+        this->VisitStmt(body->else_case.value());
+      }
     } else {
       StmtExprVisitor::VisitStmt_(op);
     }
@@ -242,8 +293,20 @@ public:
 
   void VisitStmt_(const IfThenElseNode *op) final { VisitNewScope(op); }
 
+  bool ContainsSeqStmt(const Stmt &stmt) {
+    if (stmt->IsInstance<SeqStmtNode>()) {
+      return true;
+    }
+    if (const auto *if_node = stmt.as<IfThenElseNode>()) {
+      return ContainsSeqStmt(if_node->then_case) ||
+             (if_node->else_case.defined() &&
+              ContainsSeqStmt(if_node->else_case.value()));
+    }
+    return false;
+  }
+
   void VisitStmt_(const ForNode *op) final {
-    if (op->body->IsInstance<SeqStmtNode>()) {
+    if (ContainsSeqStmt(op->body)) {
       scope_level_++;
       VisitNewScope(op);
       scope_level_--;
@@ -269,8 +332,10 @@ private:
   bool IsAppropriateSharedMemory(const Var &var) {
     return is_dynamic_ ? IsDynamicSharedMemory(var) : IsStaticSharedMemory(var);
   }
-  // Whether do dyanmic analysis.
+  // Whether do dynamic analysis.
   bool is_dynamic_{true};
+  // Whether do aggressive merge.
+  bool enable_aggressive_merge_{false};
   // Whether do verbose logging.
   bool verbose_{false};
   // Whether already in thread env.
@@ -279,6 +344,68 @@ private:
   std::vector<StmtEntry> scope_;
   // The size of the scope.
   size_t scope_level_{0};
+};
+
+class SharedMemoryAlignmentPlanner : public StmtExprVisitor {
+
+public:
+  static std::unordered_map<const VarNode *, int> Plan(const Stmt &stmt) {
+    SharedMemoryAlignmentPlanner planner;
+    planner(stmt);
+    return planner.shmem_alignment_map_;
+  }
+
+private:
+  // Helper to record alignment for a shared/shared.dyn Var under alignment
+  // scope
+  void MarkSharedVarIfNeeded(const VarNode *op) {
+    if (!op || !under_alignment_scope_)
+      return;
+    auto ptr_type = op->type_annotation.as<PointerTypeNode>();
+    if (!ptr_type)
+      return;
+    auto scope = GetPtrStorageScope(tvm::ffi::GetRef<Var>(op));
+    if (scope == "shared" || scope == "shared.dyn") {
+      auto target = Target::Current();
+      ICHECK(target.defined()) << "Target is not defined";
+      const int alignment = TargetIsHopper(target) ? 1024 : 16;
+      shmem_alignment_map_[op] = alignment;
+    }
+  }
+
+  void VisitExpr_(const CallNode *op) {
+    if (op->op.same_as(tl::tl_gemm()) || op->op.same_as(tl::tl_gemm_sp()) ||
+        op->op.same_as(tl::tma_load()) || op->op.same_as(tl::tma_store()) ||
+        op->op.same_as(tl::initialize_wgmma_descriptor()) ||
+        op->op.same_as(tl::initialize_tcgen05_descriptor())) {
+      // These intrinsics introduce stricter SMEM alignment requirements; mark
+      // the subtree.
+      under_alignment_scope_ = true;
+      StmtExprVisitor::VisitExpr_(op);
+      under_alignment_scope_ = false;
+    } else {
+      StmtExprVisitor::VisitExpr_(op);
+    }
+  }
+
+  void VisitExpr_(const VarNode *op) {
+    MarkSharedVarIfNeeded(op);
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  void VisitExpr_(const BufferLoadNode *op) {
+    // If we encounter address_of(BufferLoad(...)) or any direct BufferLoad
+    // within an alignment scope, make sure we mark the underlying shared var.
+    if (op && under_alignment_scope_) {
+      const VarNode *data_var = op->buffer->data.get();
+      MarkSharedVarIfNeeded(data_var);
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  bool under_alignment_scope_{false};
+
+  std::unordered_map<const VarNode *, int> shmem_alignment_map_;
 };
 
 /*!
@@ -290,9 +417,9 @@ public:
   explicit SharedMemoryRewriter(
       const std::unordered_map<const VarNode *, const AllocateNode *>
           &shmem_allocs,
-      bool is_dynamic = true, bool verbose = false)
-      : is_dynamic_{is_dynamic}, shmem_allocs_{shmem_allocs}, verbose_{
-                                                                  verbose} {
+      bool is_dynamic = true, bool verbose = false, int align_bytes = 0)
+      : is_dynamic_{is_dynamic}, shmem_allocs_{shmem_allocs}, verbose_{verbose},
+        align_bytes_{align_bytes} {
     if (!is_dynamic) {
       merged_buf_var_ =
           Var("buf_shmem", PointerType(PrimType(DataType::UInt(8)), "shared"));
@@ -304,9 +431,13 @@ public:
    * \param stmt the statement
    */
   void PlanReuse(const Stmt &stmt, bool is_dynamic = true,
-                 bool verbose = false) {
-    SharedMemLinearAccessPatternFinder finder(is_dynamic, verbose);
+                 bool enable_aggressive_merge = false, bool verbose = false) {
+    SharedMemLinearAccessPatternFinder finder(is_dynamic,
+                                              enable_aggressive_merge, verbose);
     finder(stmt);
+    shmem_alignment_map_ = SharedMemoryAlignmentPlanner::Plan(stmt);
+    // First compute liveness over the flattened schedule, then feed it into the
+    // arena packer.
     this->LivenessAnalysis(finder.linear_seq_, finder.stmt_attrs_);
     this->PlanMemory(finder.linear_seq_, finder.stmt_attrs_);
   }
@@ -316,46 +447,6 @@ private:
     if (op->attr_key == tir::attr::thread_extent && !allocated_) {
       // Allocate one dynamic shared memory allocation at the beginning of
       // thread scope
-      int max_layer_num = 0;
-      std::vector<const StorageEntry *> all_entry;
-      for (const auto &e : const_free_map_) {
-        all_entry.push_back(e.second);
-      }
-      for (const StorageEntry *e : sym_free_list_) {
-        all_entry.push_back(e);
-      }
-      for (const StorageEntry *e : all_entry) {
-        max_layer_num =
-            std::max(max_layer_num, static_cast<int>(e->allocs.size()));
-      }
-      // calculate align for each layer of each storage entry.
-      std::vector<int> align(max_layer_num, 0);
-      for (const StorageEntry *e : all_entry) {
-        for (int i = 0; i < static_cast<int>(e->allocs.size()); i++) {
-          for (const VarNode *buffer : e->allocs[i]) {
-            const AllocateNode *alloc = shmem_allocs_[buffer];
-            align[i] =
-                std::max(align[i], alloc->dtype.bytes() * alloc->dtype.lanes());
-          }
-        }
-      }
-      // calculate offset for each buffer based on the align of each layer
-      for (const StorageEntry *e : all_entry) {
-        PrimExpr max_inner_offset = 0;
-        for (int i = 0; i < static_cast<int>(e->allocs.size()); i++) {
-          PrimExpr inner_offset = 0;
-          for (const VarNode *buffer : e->allocs[i]) {
-            const AllocateNode *alloc = shmem_allocs_[buffer];
-            buffer_byte_offsets_[buffer] = merged_alloc_size_ + inner_offset;
-            inner_offset +=
-                alloc->extents[0] * alloc->dtype.bytes() * alloc->dtype.lanes();
-            inner_offset +=
-                indexmod(align[i] - indexmod(inner_offset, align[i]), align[i]);
-          }
-          max_inner_offset = max(max_inner_offset, inner_offset);
-        }
-        merged_alloc_size_ += max_inner_offset;
-      }
 
       if (verbose_) {
 
@@ -477,35 +568,51 @@ private:
                   {op->args[0], merged_buf_var_, extra_offset + offset, extent,
                    op->args[4]});
     } else if (op->op.same_as(builtin::ptx_cp_async())) {
-      ICHECK((op->args.size() == 5U) || (op->args.size() == 6U));
-      DataType dtype = op->dtype;
-      Var buffer = Downcast<Var>(op->args[0]);
+      ICHECK_EQ(op->args.size(), 3U)
+          << "ptx_cp_async expects 3 arguments (dst_access_ptr, "
+             "src_access_ptr, bytes)";
+
+      // Extract dst_access_ptr and check if it needs merging
+      Call dst_access_ptr = Downcast<Call>(op->args[0]);
+      ICHECK(dst_access_ptr->op.same_as(builtin::tvm_access_ptr()))
+          << "First argument must be tvm_access_ptr";
+
+      // tvm_access_ptr(ptype, data, offset, extent, rw_mask)
+      Var buffer = Downcast<Var>(dst_access_ptr->args[1]);
       if (!IsAppropriateSharedMemory(buffer)) {
         return StmtExprMutator::VisitExpr_(op);
       }
+
+      DataType dtype = op->dtype;
       PrimExpr extra_offset = GetBufferOffset(buffer, dtype);
-      PrimExpr offset = this->VisitExpr(op->args[1]);
+      PrimExpr offset = this->VisitExpr(dst_access_ptr->args[2]);
       // the dst shared memory is a byte buffer generated by merging shared
       // memory. we need to multiply the offset index by the byte size of the
       // original value dtype, to get the correct offset of merged shared
       // buffer.
       int index_factor = dtype.bytes();
-      if (op->args.size() == 5)
-        return Call(dtype, op->op,
-                    {merged_buf_var_,
-                     mul(extra_offset + offset, PrimExpr(index_factor)),
-                     op->args[2], op->args[3], op->args[4]});
-      else
-        return Call(dtype, op->op,
-                    {merged_buf_var_,
-                     mul(extra_offset + offset, PrimExpr(index_factor)),
-                     op->args[2], op->args[3], op->args[4], op->args[5]});
+
+      // Create new dst_access_ptr with merged buffer and adjusted offset
+      auto new_dst_access_ptr =
+          Call(DataType::Handle(), builtin::tvm_access_ptr(),
+               {
+                   dst_access_ptr->args[0], // ptype
+                   merged_buf_var_,         // merged buffer
+                   mul(extra_offset + offset,
+                       PrimExpr(index_factor)), // adjusted offset
+                   dst_access_ptr->args[3],     // extent
+                   dst_access_ptr->args[4]      // rw_mask
+               });
+
+      // Keep src_access_ptr and bytes unchanged
+      return Call(dtype, op->op,
+                  {new_dst_access_ptr, op->args[1], op->args[2]});
     } else {
       return StmtExprMutator::VisitExpr_(op);
     }
   }
 
-  PrimExpr GetBufferOffset(Var buffer_var, DataType dtype) {
+  PrimExpr GetBufferOffset(const Var &buffer_var, DataType dtype) {
     auto it = buffer_byte_offsets_.find(buffer_var.get());
     ICHECK(it != buffer_byte_offsets_.end())
         << "buffer_var = " << buffer_var->name_hint << ", dtype = " << dtype;
@@ -520,17 +627,200 @@ private:
 
   using StmtEntry = SharedMemLinearAccessPatternFinder::StmtEntry;
   using StmtAttr = SharedMemLinearAccessPatternFinder::StmtAttr;
-  struct StorageEntry {
-    // The constant size of the buffer in bits, only used if it is constant
-    uint64_t const_nbits{0};
-    // Allocs that shares this entry.
-    // The inner vector means a "layer"
-    // For example, it we need to allocate C in the memory of A and B:
-    // |  A: 4096 bytes |  B: 4096 bytes |
-    // |            C: 8192 bytes        |
-    // Then the allocs = {{A, B}, {C}}
-    std::vector<std::vector<const VarNode *>> allocs;
+
+  // Metadata about a single shared-memory allocation prior to merging.  This
+  // is used to build lifetimes, alignment requirements, and final offsets.
+  struct BufInfo {
+    const VarNode *var{nullptr};
+    std::string name;
+    PrimExpr size_expr;
+    std::optional<int64_t> const_size_bytes; // in bytes if compile-time known.
+    int alignment{0};                        // required byte alignment.
+    int start{0}; // first statement index touching the buf.
+    int end{0};   // one-past-last statement index.
+    DataType size_dtype{DataType::Int(32)};
   };
+
+  // Interval describing the liveness window of a (constant-sized) allocation.
+  struct Interval {
+    int start{0};
+    int end{0};
+    size_t size_bytes{0};
+    int alignment{0};
+    const VarNode *var{nullptr};
+  };
+
+  // Result of a linear-scan arena packing.  Offsets contain the byte offset for
+  // each constant-sized buffer, arena_size is the total constant footprint.
+  struct ArenaPlan {
+    size_t arena_size{0};
+    std::unordered_map<const VarNode *, size_t> offsets;
+  };
+
+  static size_t AlignUpSize(size_t value, size_t alignment) {
+    if (alignment == 0) {
+      return value;
+    }
+    size_t remainder = value % alignment;
+    if (remainder == 0) {
+      return value;
+    }
+    return value + (alignment - remainder);
+  }
+
+  struct FreeBlock {
+    size_t offset{0};
+    size_t size{0};
+  };
+
+  class FreeList {
+  public:
+    std::optional<size_t> Allocate(size_t need, size_t alignment) {
+      // Best-fit search: pick the slot that wastes the least space after
+      // alignment.
+      int best = -1;
+      size_t best_waste = std::numeric_limits<size_t>::max();
+      for (int i = 0, n = static_cast<int>(blocks_.size()); i < n; ++i) {
+        size_t aligned = AlignUpSize(blocks_[i].offset, alignment);
+        size_t head = aligned - blocks_[i].offset;
+        if (head <= blocks_[i].size && (blocks_[i].size - head) >= need) {
+          size_t waste = blocks_[i].size - head - need;
+          if (waste < best_waste) {
+            best_waste = waste;
+            best = i;
+          }
+        }
+      }
+      if (best < 0) {
+        return std::nullopt;
+      }
+      FreeBlock blk = blocks_[best];
+      size_t aligned = AlignUpSize(blk.offset, alignment);
+      size_t head = aligned - blk.offset;
+      size_t tail = blk.size - head - need;
+      blocks_.erase(blocks_.begin() + best);
+      if (head) {
+        blocks_.push_back({blk.offset, head});
+      }
+      if (tail) {
+        blocks_.push_back({aligned + need, tail});
+      }
+      Normalize();
+      return aligned;
+    }
+
+    void Free(size_t offset, size_t size) {
+      if (size == 0)
+        return;
+      blocks_.push_back({offset, size});
+      Normalize();
+    }
+
+  private:
+    void Normalize() {
+      if (blocks_.empty())
+        return;
+      std::sort(blocks_.begin(), blocks_.end(),
+                [](const FreeBlock &a, const FreeBlock &b) {
+                  return a.offset < b.offset;
+                });
+      std::vector<FreeBlock> merged;
+      merged.reserve(blocks_.size());
+      for (const FreeBlock &blk : blocks_) {
+        if (merged.empty()) {
+          merged.push_back(blk);
+          continue;
+        }
+        FreeBlock &last = merged.back();
+        size_t last_end = last.offset + last.size;
+        if (blk.offset <= last_end) {
+          size_t blk_end = blk.offset + blk.size;
+          if (blk_end > last_end) {
+            last.size = blk_end - last.offset;
+          }
+        } else {
+          merged.push_back(blk);
+        }
+      }
+      blocks_ = std::move(merged);
+    }
+
+    std::vector<FreeBlock> blocks_;
+  };
+
+  struct ActiveInterval {
+    int end{0};
+    size_t offset{0};
+    size_t size{0};
+    const VarNode *var{nullptr};
+    bool operator>(const ActiveInterval &other) const {
+      return end > other.end;
+    }
+  };
+
+  static ArenaPlan LinearScanPack(std::vector<Interval> intervals) {
+    // Process intervals in program order so lifetimes correspond to the
+    // linearised CFG.
+    std::sort(intervals.begin(), intervals.end(),
+              [](const Interval &lhs, const Interval &rhs) {
+                if (lhs.start != rhs.start) {
+                  return lhs.start < rhs.start;
+                }
+                if (lhs.size_bytes != rhs.size_bytes) {
+                  return lhs.size_bytes > rhs.size_bytes;
+                }
+                // Use name comparison for deterministic ordering instead of
+                // pointer comparison
+                return lhs.var->name_hint < rhs.var->name_hint;
+              });
+
+    std::priority_queue<ActiveInterval, std::vector<ActiveInterval>,
+                        std::greater<ActiveInterval>>
+        active;
+    FreeList freelist;
+    size_t arena_top = 0;
+    std::unordered_map<const VarNode *, size_t> offsets;
+
+    // Expire intervals that end before or at program counter `pc`.
+    auto retire = [&](int pc) {
+      while (!active.empty() && active.top().end <= pc) {
+        const ActiveInterval top = active.top();
+        active.pop();
+        freelist.Free(top.offset, top.size);
+      }
+    };
+
+    for (const Interval &interval : intervals) {
+      retire(interval.start);
+      size_t offset = 0;
+      // Try to recycle previously freed memory first; fall back to bumping the
+      // arena.
+      if (auto slot =
+              freelist.Allocate(interval.size_bytes, interval.alignment)) {
+        offset = slot.value();
+      } else {
+        offset = AlignUpSize(arena_top, interval.alignment);
+        arena_top = offset + interval.size_bytes;
+      }
+      active.push(ActiveInterval{interval.end, offset, interval.size_bytes,
+                                 interval.var});
+      offsets[interval.var] = offset;
+    }
+
+    return ArenaPlan{arena_top, std::move(offsets)};
+  }
+
+  PrimExpr AlignPrimExpr(const PrimExpr &value, int alignment) const {
+    if (alignment <= 1) {
+      return value;
+    }
+    DataType dtype = value.dtype();
+    ICHECK(dtype.is_int() || dtype.is_uint())
+        << "Expected integer dtype for alignment, but got " << dtype;
+    PrimExpr align_expr = make_const(dtype, alignment);
+    PrimExpr adjust = make_const(dtype, alignment - 1);
+    return indexdiv(value + adjust, align_expr) * align_expr;
+  }
 
   // Event entry in liveness analysis
   struct EventEntry {
@@ -540,6 +830,18 @@ private:
     std::vector<const VarNode *> kill;
   };
 
+  void PlanAlignment(const Stmt &stmt) {
+    DLOG(INFO) << "PlanAlignment";
+    PostOrderVisit(stmt, [&](const ObjectRef &node) {
+      if (const auto *call = node.as<CallNode>()) {
+        if (call->op.same_as(tl::tl_gemm()) ||
+            call->op.same_as(tl::tl_gemm_sp())) {
+          DLOG(INFO) << "PostOrderVisit CallNode tl_gemm and tl_gemm_sp: "
+                     << call->op;
+        }
+      }
+    });
+  }
   /*!
    * \brief Liveness analysis to find gen and kill point of each variable.
    * \param seq the linear pattern of storage access
@@ -641,8 +943,8 @@ private:
     std::vector<StmtEntry> gen_kill_seq;
     for (const auto &stmt_entry : seq) {
       // if has gen and kill, add to gen_kill_seq
-      if (event_map_[stmt_entry.stmt].gen.size() > 0 ||
-          event_map_[stmt_entry.stmt].kill.size() > 0) {
+      if (!event_map_[stmt_entry.stmt].gen.empty() ||
+          !event_map_[stmt_entry.stmt].kill.empty()) {
         gen_kill_seq.push_back(stmt_entry);
       }
     }
@@ -787,164 +1089,246 @@ private:
   void
   PlanMemory(const std::vector<StmtEntry> &seq,
              const std::unordered_map<const Object *, StmtAttr> &stmt_attrs) {
-    std::unordered_set<const VarNode *> inplace_flag;
+    buffer_byte_offsets_.clear();
+    (void)stmt_attrs;
+
+    if (shmem_allocs_.empty()) {
+      merged_alloc_size_ = make_const(DataType::Int(64), 0);
+      return;
+    }
+
+    // Discover the first and last touch for every allocation.
+    std::unordered_map<const VarNode *, int> start_index;
+    std::unordered_map<const VarNode *, int> end_index;
 
     for (size_t i = 0; i < seq.size(); ++i) {
       auto it = event_map_.find(seq[i].stmt);
-      // scope_pair_offset <= 0 means it is either
-      // - leaf stmt(offset = 0)
-      // - end of scope(offset < 0)
-      // In both cases, we need to handle the kill event correctly
-      auto is_leaf_alloc = [&](const VarNode *var) {
-        return seq[i].scope_pair_offset == 0 &&
-               std::find(it->second.gen.begin(), it->second.gen.end(), var) !=
-                   it->second.gen.end();
-      };
-      if (it != event_map_.end() && seq[i].scope_pair_offset <= 0) {
-        for (const VarNode *var : it->second.kill) {
-          if (!is_leaf_alloc(var))
-            this->Free(var);
-        }
+      if (it == event_map_.end())
+        continue;
+      for (const VarNode *var : it->second.gen) {
+        start_index.emplace(var, static_cast<int>(i));
       }
-      // scope_pair_offset >= 0 means it is either
-      // - leaf stmt(offset = 0)
-      // - beginning of scope(offset < 0)
-      // In both cases, we need to handle the gen event correctly
-      if (it != event_map_.end() && seq[i].scope_pair_offset >= 0) {
-        for (const VarNode *var : it->second.gen) {
-          ICHECK(shmem_allocs_.count(var));
-          const AllocateNode *alloc = shmem_allocs_[var];
-          StorageEntry *dst_entry = FindAlloc(alloc);
-          alloc_map_[var] = dst_entry;
-        }
+      for (const VarNode *var : it->second.kill) {
+        end_index[var] = std::max(end_index[var], static_cast<int>(i) + 1);
       }
-      if (it != event_map_.end() && seq[i].scope_pair_offset <= 0) {
-        for (const VarNode *var : it->second.kill) {
-          if (is_leaf_alloc(var))
-            this->Free(var);
-        }
-      }
-    }
-  }
-  /*!
-   * \brief Allocate new storage entry.
-   * \param op the allocate node
-   * \param the size of the allocation in bits
-   * \return the new storage entry
-   */
-  StorageEntry *NewAlloc(const AllocateNode *op, size_t const_nbits) {
-    ICHECK(op != nullptr);
-    // Re-use not successful, allocate a new buffer.
-    StorageEntry *entry = arena_.make<StorageEntry>();
-    entry->allocs.push_back({op->buffer_var.get()});
-    entry->const_nbits = const_nbits;
-    return entry;
-  }
-  /*!
-   * \brief find the storage entry in the free list for the allocate
-   * \param op the allocate node
-   * \return the storage entry
-   */
-  StorageEntry *FindAlloc(const AllocateNode *op) {
-    ICHECK(op != nullptr);
-    // skip plan for local variable,
-    // compiler can do a better job with register allocation.
-    const uint64_t match_range = 16;
-    uint64_t op_elem_bits = op->dtype.bits() * op->dtype.lanes();
-    uint64_t const_nbits =
-        static_cast<uint64_t>(op->ConstantAllocationSize() * op_elem_bits);
-    // disable reuse of small arrays, they will be lowered to registers in LLVM
-    // This rules only apply if we are using non special memory
-    if (const_nbits > 0 && const_nbits <= 32) {
-      return NewAlloc(op, const_nbits);
     }
 
-    if (const_nbits != 0) {
-      // constant allocation.
-      auto begin = const_free_map_.lower_bound(0);
-      auto mid = const_free_map_.lower_bound(const_nbits);
-      auto end = const_free_map_.upper_bound(const_nbits * match_range);
-      // Start looking at the buffer that is bigger than the required size
-      // first. If we find one, directly allocate the buffer in its location and
-      // remove its entry in the free list
-      for (auto it = mid; it != end; ++it) {
-        StorageEntry *e = it->second;
-        e->const_nbits = std::max(const_nbits, e->const_nbits);
-        const_free_map_.erase(it);
-        it->second->allocs.push_back({op->buffer_var.get()});
-        return e;
+    const int seq_len = static_cast<int>(seq.size());
+    for (const auto &kv : start_index) {
+      if (!end_index.count(kv.first)) {
+        end_index[kv.first] = seq_len;
       }
-      // Then start looking at smaller buffers.
-      // Keep collecting the buffer until the sum of their size exceeds the
-      // buffer to allocate and finally free all these entry in the free list
-      std::vector<std::multimap<uint64_t, StorageEntry *>::iterator> delete_it;
-      // the alloc list for the new entry
-      std::vector<std::vector<const VarNode *>> reuse_allocs;
-      uint64_t mem_ct = 0;
-      for (auto it = mid; it != begin;) {
-        --it;
-        delete_it.push_back(it);
-        mem_ct += it->second->const_nbits;
-        int n = it->second->allocs.size();
-        if (n > static_cast<int>(reuse_allocs.size())) {
-          reuse_allocs.resize(n, {});
+    }
+
+    // Create a sorted vector of keys from shmem_allocs_ for deterministic
+    // iteration
+    std::vector<const VarNode *> sorted_vars;
+    sorted_vars.reserve(shmem_allocs_.size());
+    for (const auto &kv : shmem_allocs_) {
+      sorted_vars.push_back(kv.first);
+    }
+    std::sort(sorted_vars.begin(), sorted_vars.end(),
+              [](const VarNode *a, const VarNode *b) {
+                return a->name_hint < b->name_hint;
+              });
+
+    std::vector<BufInfo> buf_infos;
+    buf_infos.reserve(shmem_allocs_.size());
+    // Build a BufInfo for all allocations that participate in liveness.
+    for (const VarNode *var : sorted_vars) {
+      auto start_it = start_index.find(var);
+      if (start_it == start_index.end()) {
+        continue;
+      }
+
+      BufInfo info;
+      info.var = var;
+      info.name = var->name_hint;
+      info.start = start_it->second;
+      info.end = std::max(end_index[var], info.start + 1);
+      info.alignment = align_bytes_;
+      auto align_it = shmem_alignment_map_.find(var);
+      if (align_it != shmem_alignment_map_.end()) {
+        info.alignment = std::max(info.alignment, align_it->second);
+      }
+
+      const AllocateNode *alloc = shmem_allocs_.at(var);
+      int64_t bytes_per_elem =
+          static_cast<int64_t>(alloc->dtype.bytes() * alloc->dtype.lanes());
+      DataType size_dtype = DataType::Int(32);
+      if (!alloc->extents.empty()) {
+        size_dtype = alloc->extents[0].dtype();
+      }
+      if (!size_dtype.is_int() && !size_dtype.is_uint()) {
+        size_dtype = DataType::Int(32);
+      }
+
+      PrimExpr size_expr = make_const(size_dtype, bytes_per_elem);
+      for (const PrimExpr &extent : alloc->extents) {
+        PrimExpr e = extent;
+        if (e.dtype() != size_dtype) {
+          e = cast(size_dtype, e);
         }
-        for (int i = 0; i < n; i++) {
-          for (const VarNode *alloc : it->second->allocs[i]) {
-            reuse_allocs[i].push_back(alloc);
+        size_expr = size_expr * e;
+      }
+      info.size_dtype = size_dtype;
+      info.size_expr = size_expr;
+
+      int64_t const_extent = alloc->ConstantAllocationSize();
+      if (const_extent >= 0) {
+        info.const_size_bytes = const_extent * bytes_per_elem;
+      }
+
+      buf_infos.push_back(std::move(info));
+    }
+
+    // Stable order so the later passes have deterministic behaviour.
+    std::sort(buf_infos.begin(), buf_infos.end(),
+              [](const BufInfo &a, const BufInfo &b) {
+                if (a.start != b.start)
+                  return a.start < b.start;
+                if (a.end != b.end)
+                  return a.end < b.end;
+                return a.name < b.name;
+              });
+
+    std::vector<Interval> intervals;
+    intervals.reserve(buf_infos.size());
+    for (const BufInfo &info : buf_infos) {
+      if (!info.const_size_bytes.has_value())
+        continue;
+      // Only constant-sized buffers participate in the arena packing because
+      // dynamic sizes must be placed sequentially later.
+      Interval interval;
+      interval.start = info.start;
+      interval.end = info.end;
+      interval.size_bytes = static_cast<size_t>(
+          std::max<int64_t>(0, info.const_size_bytes.value()));
+      interval.alignment = info.alignment;
+      interval.var = info.var;
+      intervals.push_back(interval);
+    }
+
+    ArenaPlan plan = LinearScanPack(std::move(intervals));
+    size_t arena_size_const = plan.arena_size;
+
+    if (verbose_) {
+      LOG(DEBUG) << "ArenaPlan (constant buffers): arena_size="
+                 << arena_size_const;
+      for (const auto &kv : plan.offsets) {
+        const VarNode *var = kv.first;
+        LOG(DEBUG) << "  " << var->name_hint << " -> offset=" << kv.second;
+      }
+    }
+
+    // Cursor tracks the running byte offset within the merged arena.
+    DataType offset_dtype =
+        buf_infos.empty() ? DataType::Int(32) : buf_infos.front().size_dtype;
+    PrimExpr total_size = make_const(offset_dtype, 0);
+    PrimExpr cursor = AlignPrimExpr(
+        make_const(offset_dtype, static_cast<int64_t>(arena_size_const)),
+        align_bytes_);
+
+    auto CastToOffset = [&](PrimExpr expr) -> PrimExpr {
+      if (expr.dtype() == offset_dtype) {
+        return expr;
+      }
+      return cast(offset_dtype, expr);
+    };
+
+    for (const BufInfo &info : buf_infos) {
+      PrimExpr offset_expr;
+      auto it = plan.offsets.find(info.var);
+      if (it != plan.offsets.end()) {
+        offset_expr =
+            make_const(offset_dtype, static_cast<int64_t>(it->second));
+      } else {
+        // Dynamic-sized buffers are appended after the constant arena.
+        cursor = AlignPrimExpr(cursor, info.alignment);
+        PrimExpr size_expr = CastToOffset(info.size_expr);
+        offset_expr = cursor;
+        cursor = offset_expr + size_expr;
+      }
+
+      buffer_byte_offsets_[info.var] = offset_expr;
+      PrimExpr buf_end = offset_expr + CastToOffset(info.size_expr);
+      total_size = max(total_size, buf_end);
+    }
+
+    merged_alloc_size_ = buf_infos.empty()
+                             ? make_const(offset_dtype, 0)
+                             : AlignPrimExpr(total_size, align_bytes_);
+
+    bool overlap_detected = false;
+
+    if (verbose_) {
+      LOG(DEBUG) << "Memory Allocation Plan for "
+                 << (is_dynamic_ ? "Dynamic" : "Static") << " Shared Memory:";
+      LOG(DEBUG) << "  Total Merged Size (aligned): " << merged_alloc_size_;
+      for (const BufInfo &info : buf_infos) {
+        const PrimExpr &offset = buffer_byte_offsets_.at(info.var);
+        LOG(DEBUG) << "    Buffer: " << info.name << " start=" << info.start
+                   << " end=" << info.end << " alignment=" << info.alignment
+                   << " offset=" << offset << " size=" << info.size_expr;
+      }
+      // Sanity check for overlapping constant buffers.
+      for (size_t i = 0; i < buf_infos.size(); ++i) {
+        const BufInfo &a = buf_infos[i];
+        auto a_off_imm = buffer_byte_offsets_.at(a.var).as<IntImmNode>();
+        if (!a.const_size_bytes.has_value() || a_off_imm == nullptr)
+          continue;
+        int64_t a_off = a_off_imm->value;
+        int64_t a_end = a_off + a.const_size_bytes.value();
+        for (size_t j = i + 1; j < buf_infos.size(); ++j) {
+          const BufInfo &b = buf_infos[j];
+          auto b_off_imm = buffer_byte_offsets_.at(b.var).as<IntImmNode>();
+          if (!b.const_size_bytes.has_value() || b_off_imm == nullptr)
+            continue;
+          bool live_overlap = !(a.end <= b.start || b.end <= a.start);
+          if (!live_overlap)
+            continue;
+          int64_t b_off = b_off_imm->value;
+          int64_t b_end = b_off + b.const_size_bytes.value();
+          bool mem_overlap = !(a_end <= b_off || b_end <= a_off);
+          if (mem_overlap) {
+            overlap_detected = true;
+            LOG(WARNING) << "Buffer overlap detected between " << a.name
+                         << " and " << b.name << " (lifetime overlap with "
+                         << "offset ranges [" << a_off << ", " << a_end
+                         << ") and [" << b_off << ", " << b_end << ")).";
           }
         }
-        if (mem_ct >= const_nbits) {
-          break;
-        }
-      }
-      reuse_allocs.push_back({op->buffer_var.get()});
-      if (mem_ct != 0) {
-        StorageEntry *e = arena_.make<StorageEntry>();
-        e->const_nbits = std::max(const_nbits, mem_ct);
-        e->allocs = reuse_allocs;
-        for (auto it : delete_it) {
-          const_free_map_.erase(it);
-        }
-        return e;
-      }
-    } else {
-      // if its symbolic allocation, just arbitrarily choose one entry to fit in
-      // because we don't know its actual size
-      for (auto it = sym_free_list_.begin(); it != sym_free_list_.end(); ++it) {
-        StorageEntry *e = *it;
-        sym_free_list_.erase(it);
-        return e;
       }
     }
-    return NewAlloc(op, const_nbits);
-  }
 
-  /*!
-   * \brief add the storage entry to the buffer var into the free list.
-   * \param var the buffer var
-   */
-  void Free(const VarNode *var) {
-    auto it = alloc_map_.find(var);
-    ICHECK(it != alloc_map_.end());
-    StorageEntry *e = it->second;
-    ICHECK_NE(e->allocs.size(), 0U);
-
-    // disable reuse of small arrays
-    if (e->const_nbits > 0 && e->const_nbits <= 32)
-      return;
-
-    // normal free.
-    if (e->const_nbits != 0) {
-      const_free_map_.insert({e->const_nbits, e});
-    } else {
-      sym_free_list_.push_back(e);
+    if (overlap_detected) {
+      LOG(WARNING) << "Detected overlapping constant buffers; falling back to "
+                   << "sequential allocation without reuse.";
+      buffer_byte_offsets_.clear();
+      // In the fallback path we simply lay buffers out sequentially.
+      PrimExpr new_cursor = make_const(offset_dtype, 0);
+      PrimExpr new_total = make_const(offset_dtype, 0);
+      for (const BufInfo &info : buf_infos) {
+        new_cursor = AlignPrimExpr(new_cursor, info.alignment);
+        PrimExpr size_expr = CastToOffset(info.size_expr);
+        buffer_byte_offsets_[info.var] = new_cursor;
+        PrimExpr buf_end = new_cursor + size_expr;
+        new_total = max(new_total, buf_end);
+        new_cursor = buf_end;
+      }
+      merged_alloc_size_ = buf_infos.empty()
+                               ? make_const(offset_dtype, 0)
+                               : AlignPrimExpr(new_total, align_bytes_);
     }
   }
-  // Wheather enable dyanmic analysis.
+
+  // Whether enable dynamic analysis.
   bool is_dynamic_{true};
+
   // Whether enable verbose logging.
   bool verbose_{false};
+  // The alignment bytes for the merged buffer
+  int align_bytes_{16};
   // The var for the merged buffer
   Var merged_buf_var_{"buf_dyn_shmem",
                       PointerType(PrimType(DataType::UInt(8)), "shared.dyn")};
@@ -961,29 +1345,25 @@ private:
   bool allocated_{false};
   // Locations of free ops.
   std::unordered_map<const Object *, EventEntry> event_map_;
-  // constant size free map.
-  std::multimap<uint64_t, StorageEntry *> const_free_map_;
-  // symbolic free list, for non constant items.
-  std::list<StorageEntry *> sym_free_list_;
-  // The allocation assign map
-  std::unordered_map<const VarNode *, StorageEntry *> alloc_map_;
-  /*! \brief allocator of all the StorageEntry*/
-  support::Arena arena_;
+  // The mapping of buffer bytes alignment
+  std::unordered_map<const VarNode *, int> shmem_alignment_map_;
 };
 
 Stmt MergeSharedMemoryAllocations(Stmt stmt, bool merge_static_smem,
-                                  bool verbose = false) {
+                                  bool enable_aggressive_merge,
+                                  int align_bytes = 16, bool verbose = false) {
   AllocateCollector collector;
   collector(stmt);
   if (collector.dyn_shmem_allocs_.size() > 1) {
-    SharedMemoryRewriter rewriter(collector.dyn_shmem_allocs_, true, verbose);
-    rewriter.PlanReuse(stmt);
+    SharedMemoryRewriter rewriter(collector.dyn_shmem_allocs_, true, verbose,
+                                  align_bytes);
+    rewriter.PlanReuse(stmt, true, enable_aggressive_merge);
     stmt = rewriter(std::move(stmt));
   }
   if (merge_static_smem && collector.static_shmem_allocs_.size() > 1) {
     SharedMemoryRewriter rewriter(collector.static_shmem_allocs_, false,
-                                  verbose);
-    rewriter.PlanReuse(stmt, false);
+                                  verbose, align_bytes);
+    rewriter.PlanReuse(stmt, false, enable_aggressive_merge);
     stmt = rewriter(std::move(stmt));
   }
   return stmt;
@@ -993,25 +1373,30 @@ using namespace tir::transform;
 
 namespace transform {
 
-Pass MergeSharedMemoryAllocations() {
-  auto pass_func = [](PrimFunc f, IRModule m, PassContext ctx) {
+Pass MergeSharedMemoryAllocations(bool enable_aggressive_merge = false,
+                                  int align_bytes = 16) {
+  auto pass_func = [enable_aggressive_merge, align_bytes](
+                       PrimFunc f, const IRModule &m, PassContext ctx) {
     bool merge_static_smem =
         ctx->GetConfig<Bool>("tir.merge_static_smem", Bool(false)).value();
     bool debug_merge_shared_memory_allocations =
         ctx->GetConfig<Bool>(kDebugMergeSharedMemoryAllocations, Bool(false))
             .value();
     auto *n = f.CopyOnWrite();
-    n->body =
-        tl::MergeSharedMemoryAllocations(std::move(n->body), merge_static_smem,
-                                         debug_merge_shared_memory_allocations);
+    n->body = tl::MergeSharedMemoryAllocations(
+        std::move(n->body), merge_static_smem, enable_aggressive_merge,
+        align_bytes, debug_merge_shared_memory_allocations);
     return f;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.MergeSharedMemoryAllocations",
                             {});
 }
 
-TVM_REGISTER_GLOBAL("tl.transform.MergeSharedMemoryAllocations")
-    .set_body_typed(MergeSharedMemoryAllocations);
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = tvm::ffi::reflection;
+  refl::GlobalDef().def("tl.transform.MergeSharedMemoryAllocations",
+                        MergeSharedMemoryAllocations);
+}
 
 } // namespace transform
 } // namespace tl

@@ -4,13 +4,12 @@ import tilelang.language as T
 
 # add decorator @tilelang.jit if you want to return a torch function
 # @tilelang.jit
-def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float"):
-
+def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float32):
     @T.prim_func
     def main(
-            A: T.Tensor((M, K), dtype),
-            B: T.Tensor((N, K), dtype),
-            C: T.Tensor((M, N), dtype),
+        A: T.Tensor((M, K), dtype),
+        B: T.Tensor((N, K), dtype),
+        C: T.Tensor((M, N), dtype),
     ):
         # Initialize Kernel Context
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
@@ -27,7 +26,9 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="flo
             for ko in T.Pipelined(T.ceildiv(K, block_K), num_stages=0):
                 # Copy tile of A
                 # This is a sugar syntax for parallelized copy
-                T.copy(A[by * block_M, ko * block_K], X_shared)
+                aliased_offset = T.int32()
+                T.let(aliased_offset, ko * block_K)
+                T.copy(A[by * block_M, aliased_offset], X_shared)
 
                 # Demonstrate parallelized copy from global to shared for B
                 T.copy(B[bx * block_N, ko * block_K], B_shared[:block_N, :block_K])
@@ -42,9 +43,9 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="flo
     return main
 
 
-def run_matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float"):
+def run_matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float32):
     program = matmul(M, N, K, block_M, block_N, block_K, dtype, accum_dtype)
-    kernel = tilelang.compile(program, out_idx=[2], target="cuda")
+    kernel = tilelang.compile(program, out_idx=[2])
     kernel.run_once()
 
 

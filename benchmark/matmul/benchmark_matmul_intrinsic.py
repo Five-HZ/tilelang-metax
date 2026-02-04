@@ -6,7 +6,8 @@ import tilelang as tl
 import tilelang.language as T
 from tilelang.intrinsics import get_swizzle_layout
 from tilelang.intrinsics.mma_macro_generator import (
-    TensorCoreIntrinEmitter,)
+    TensorCoreIntrinEmitter,
+)
 from tilelang.transform import simplify_prim_func
 from tilelang.autotuner import autotune
 import itertools
@@ -48,22 +49,22 @@ def tl_matmul(
     enable_rasteration=False,
 ):
     assert in_dtype in [
-        "float16",
-        "int8",
+        T.float16,
+        T.int8,
     ], "Currently only float16 and int8 are supported"
     assert out_dtype in [
-        "float16",
-        "float32",
-        "int32",
+        T.float16,
+        T.float32,
+        T.int32,
     ], "Currently only float16, float32 and int32 are supported"
 
     micro_size_x = micro_size_y = micro_size_k = 16
 
-    if out_dtype == "int32":
+    if out_dtype == T.int32:
         micro_size_k = 32
 
     # This is a debug config
-    # chunk = 32 if in_dtype == "float16" else 64
+    # chunk = 32 if in_dtype == T.float16 else 64
     shared_scope = "shared.dyn"
 
     block_M = block_row_warps * warp_row_tiles
@@ -103,12 +104,11 @@ def tl_matmul(
 
     @T.prim_func
     def main(
-            A: T.Tensor(A_shape, in_dtype),
-            B: T.Tensor(B_shape, in_dtype),
-            C: T.Tensor((M, N), out_dtype),
+        A: T.Tensor(A_shape, in_dtype),
+        B: T.Tensor(B_shape, in_dtype),
+        C: T.Tensor((M, N), out_dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
-
             A_shared = T.alloc_shared(A_shared_shape, in_dtype, scope=shared_scope)
             B_shared = T.alloc_shared(B_shared_shape, in_dtype, scope=shared_scope)
             C_shared = T.alloc_shared(C_shared_shape, out_dtype, scope=shared_scope)
@@ -116,10 +116,12 @@ def tl_matmul(
             B_local = T.alloc_local((warp_cols * local_size_b), in_dtype)
             C_local = T.alloc_local((warp_rows * warp_cols * local_size_c), accum_dtype)
 
-            T.annotate_layout({
-                A_shared: make_swizzle_layout(A_shared),
-                B_shared: make_swizzle_layout(B_shared),
-            })
+            T.annotate_layout(
+                {
+                    A_shared: make_swizzle_layout(A_shared),
+                    B_shared: make_swizzle_layout(B_shared),
+                }
+            )
 
             # Improve L2 Cache
             T.use_swizzle(panel_size=10, enable=enable_rasteration)
@@ -127,7 +129,6 @@ def tl_matmul(
             T.clear(C_local)
 
             for ko in T.Pipelined((K // block_K), num_stages=stage):
-
                 # Load A into shared memory
                 for i, k in T.Parallel(block_M, block_K):
                     A_shared[i, k] = A[by * block_M + i, ko * block_K + k]
@@ -137,7 +138,6 @@ def tl_matmul(
                     B_shared[j, k] = B[bx * block_N + j, ko * block_K + k]
 
                 for ki in T.serial(0, (block_K // micro_size_k)):
-
                     # Load A into fragment
                     mma_emitter.ldmatrix_a(A_local, A_shared, ki)
 
@@ -162,10 +162,10 @@ def ref_program(A, B):
     return A @ B.T
 
 
-def get_configs(M, N, K, with_roller=False):
+def get_configs(args, kwargs):
     """
     Generate a list of configuration dictionaries that will be used for tuning.
-    
+
     Parameters
     ----------
     with_roller : bool
@@ -177,20 +177,26 @@ def get_configs(M, N, K, with_roller=False):
         Each configuration dict includes various block sizes, pipeline stages,
         thread numbers, and other parameters to explore during autotuning.
     """
+    M, N, K = args[:3]
+    with_roller = args[6]
+
     if with_roller:
         from tilelang.carver.template import MatmulTemplate
         from tilelang.carver.arch import CUDA
+        from tilelang.carver.arch import CDNA
         from tilelang.carver.roller.rasterization import NoRasterization
-        arch = CUDA("cuda")
+        import torch
+
+        arch = CUDA("cuda") if torch.version.hip is None else CDNA("hip")
         topk = 10
 
         carve_template = MatmulTemplate(
             M=M,
             N=N,
             K=K,
-            in_dtype="float16",
-            out_dtype="float16",
-            accum_dtype="float16",
+            in_dtype=T.float16,
+            out_dtype=T.float16,
+            accum_dtype=T.float16,
         ).with_arch(arch)
 
         func = carve_template.equivalent_function()
@@ -217,63 +223,49 @@ def get_configs(M, N, K, with_roller=False):
         for config in configs:
             print(config)
     else:
-
-        block_rows_warps = [1, 2, 4]
-        block_col_warps = [1, 2, 4]
-        warp_row_tiles = [16, 32, 64, 128]
-        warp_col_tiles = [16, 32, 64, 128]
-        chunk = [32, 64, 128, 256]
-        stage = [0, 2]
-        enable_rasteration = [True, False]
-        _configs = list(
-            itertools.product(block_rows_warps, block_col_warps, warp_row_tiles, warp_col_tiles,
-                              chunk, stage, enable_rasteration))
-        configs = [{
-            "block_row_warps": c[0],
-            "block_col_warps": c[1],
-            "warp_row_tiles": c[2],
-            "warp_col_tiles": c[3],
-            "chunk": c[4],
-            "stage": c[5],
-            "enable_rasteration": c[6],
-        } for c in _configs]
+        iter_params = dict(
+            block_row_warps=[1, 2, 4],
+            block_col_warps=[1, 2, 4],
+            warp_row_tiles=[16, 32, 64, 128],
+            warp_col_tiles=[16, 32, 64, 128],
+            chunk=[32, 64, 128, 256],
+            stage=[0, 2],
+            enable_rasteration=[True, False],
+        )
+        return [{k: v for k, v in zip(iter_params, values)} for values in itertools.product(*iter_params.values())]
 
     return configs
 
 
-def matmul(M,
-           N,
-           K,
-           in_dtype="float16",
-           out_dtype="float16",
-           accum_dtype="float16",
-           with_roller=False):
+@autotune(
+    configs=get_configs,
+    warmup=3,
+    rep=5,
+    ref_prog=ref_program,
+    skip_check=True,
+)
+@tl.jit(
+    out_idx=[2],
+)
+def matmul(
+    M,
+    N,
+    K,
+    in_dtype=T.float16,
+    out_dtype=T.float16,
+    accum_dtype=T.float16,
+    with_roller=False,
+    block_row_warps=None,
+    block_col_warps=None,
+    warp_row_tiles=None,
+    warp_col_tiles=None,
+    chunk=None,
+    stage=None,
+    enable_rasteration=None,
+):
     """Create an autotuned tensor core matrix multiplication kernel."""
 
-    @autotune(
-        configs=get_configs(M, N, K, with_roller),
-        keys=[
-            "block_row_warps",
-            "block_col_warps",
-            "warp_row_tiles",
-            "warp_col_tiles",
-            "chunk",
-            "enable_rasteration",
-            "stage",
-        ],
-        warmup=3,
-        rep=5,
-    )
-    @tl.jit(out_idx=[2],)
-    def kernel(
-        block_row_warps=None,
-        block_col_warps=None,
-        warp_row_tiles=None,
-        warp_col_tiles=None,
-        chunk=None,
-        stage=None,
-        enable_rasteration=None,
-    ):
+    def kernel():
         return tl_matmul(
             M,
             N,
@@ -298,19 +290,14 @@ if __name__ == "__main__":
     parser.add_argument("--m", type=int, default=16384, help="Matrix dimension M")
     parser.add_argument("--n", type=int, default=16384, help="Matrix dimension N")
     parser.add_argument("--k", type=int, default=16384, help="Matrix dimension K")
-    parser.add_argument(
-        "--with_roller",
-        type=bool,
-        default=False,
-        help="Whether to use roller to deduce search spaces")
-    parser.add_argument(
-        "--dtype", type=str, default="float16", choices=["float16", "int8"], help="Input data type")
+    parser.add_argument("--with_roller", type=bool, default=False, help="Whether to use roller to deduce search spaces")
+    parser.add_argument("--dtype", type=str, default="float16", choices=["float16", "int8"], help="Input data type")
     args = parser.parse_args()
 
     M, N, K = args.m, args.n, args.k
-    in_dtype = args.dtype
-    out_dtype = "float32" if in_dtype == "int8" else "float16"
-    accum_dtype = "float32" if in_dtype == "int8" else "float16"
+    in_dtype = T.dtype(args.dtype)
+    out_dtype = T.float32 if in_dtype == T.int8 else T.float16
+    accum_dtype = T.float32 if in_dtype == T.int8 else T.float16
     with_roller = args.with_roller
     with_roller = True
     # Compute total floating-point operations

@@ -1,10 +1,20 @@
-# if dist and build directories exist, remove them
-if [ -d dist ]; then
-    rm -r dist
-fi
+#!/usr/bin/env bash
 
-if [ -d build ]; then
-    rm -r build
-fi
+set -eux
 
-PYPI_BUILD=TRUE python setup.py bdist_wheel --plat-name=manylinux1_x86_64
+rm -rf dist raw_dist
+
+python -mpip install -U pip
+python -mpip install -U build wheel auditwheel patchelf
+
+export NO_VERSION_LABEL=1
+
+python -m build --sdist -o dist
+python -m build --wheel -o raw_dist
+
+auditwheel repair -L /lib -w dist \
+    --exclude libcuda.so.1 --exclude /usr/local/cuda\* --exclude /opt/amdgpu\* \
+    --exclude /opt/rocm\* \
+    raw_dist/*.whl
+
+echo "Wheel built successfully."

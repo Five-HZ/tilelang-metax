@@ -1,26 +1,25 @@
 # pylint: disable=invalid-name
 # modified from apache tvm python/tvm/contrib/nvcc.py
 """Utility to invoke nvcc compiler in the system"""
-from __future__ import absolute_import as _abs
+
+from __future__ import annotations
 
 import os
 import subprocess
 import warnings
-from ..env import CUDA_HOME
-
-import tvm._ffi
+import contextlib
+from tilelang.env import CUDA_HOME, CUTLASS_INCLUDE_DIR, TILELANG_TEMPLATE_PATH
+import shutil
+import tempfile
+import tvm_ffi
+from tilelang import tvm as tvm
 from tvm.target import Target
 
-from tvm._ffi.base import py_str
+from tvm.base import py_str
 from tvm.contrib import utils
 
 
-def compile_cuda(code,
-                 target_format="ptx",
-                 arch=None,
-                 options=None,
-                 path_target=None,
-                 verbose=False):
+def compile_cuda(code, target_format="ptx", arch=None, options=None, path_target=None, verbose=False):
     """Compile cuda code with NVCC from env.
 
     Parameters
@@ -52,9 +51,9 @@ def compile_cuda(code,
         #   "-gencode", "arch=compute_52,code=sm_52",
         #   "-gencode", "arch=compute_70,code=sm_70"
         # ]
-        compute_version = "".join(
-            get_target_compute_version(Target.current(allow_none=True)).split("."))
-        arch = ["-gencode", f"arch=compute_{compute_version},code=sm_{compute_version}"]
+        compute_version = get_target_compute_version(Target.current(allow_none=True))
+        target_arch = get_target_arch(compute_version)
+        arch = ["-gencode", f"arch=compute_{target_arch},code=sm_{target_arch}"]
 
     temp = utils.tempdir()
     file_name = "tvm_kernels"
@@ -64,7 +63,7 @@ def compile_cuda(code,
     temp_target = temp.relpath(f"{file_name}.{target_format}")
 
     pass_context = tvm.get_global_func("transform.GetCurrentPassContext")()
-    kernels_output_dir = (pass_context.config.get("cuda.kernels_output_dir", None))
+    kernels_output_dir = pass_context.config.get("cuda.kernels_output_dir", None)
     if kernels_output_dir is not None:
         if not os.path.isdir(kernels_output_dir):
             os.makedirs(kernels_output_dir)
@@ -75,10 +74,10 @@ def compile_cuda(code,
         out_file.write(code)
 
     file_target = path_target if path_target else temp_target
-    cmd = ["nvcc"]
+    cmd = [get_nvcc_compiler()]
     cmd += [f"--{target_format}", "-O3"]
-    if kernels_output_dir is not None:
-        cmd += ["-lineinfo"]
+    # Always include line info for better profiling and mapping
+    cmd += ["-lineinfo"]
     if isinstance(arch, list):
         cmd += arch
     elif isinstance(arch, str):
@@ -111,10 +110,7 @@ def compile_cuda(code,
         print(py_str(out))
 
     if proc.returncode != 0:
-        msg = f"{code}\n" \
-            f"Compilation error:\n" \
-            f"{py_str(out)}\n" \
-            f"Command: {' '.join(cmd)}\n"
+        msg = f"{code}\nCompilation error:\n{py_str(out)}\nCommand: {' '.join(cmd)}\n"
         raise RuntimeError(msg)
 
     with open(file_target, "rb") as f:
@@ -124,9 +120,151 @@ def compile_cuda(code,
         return data
 
 
+def default_compile_options(compile_flags: list[str] | None = None) -> list[str]:
+    """
+    Build a set of default NVCC compile options for TileLang generated sources.
+
+    Includes C++ standard and common include paths (TileLang templates, CUTLASS,
+    CUDA include). Merges user-provided compile flags if given.
+
+    Parameters
+    ----------
+    compile_flags : Optional[List[str]]
+        Additional flags to include. Items are split on whitespace.
+
+    Returns
+    -------
+    List[str]
+        A list of flags suitable for NVCC's command line.
+    """
+    options: list[str] = ["-std=c++17"]
+    try:
+        if TILELANG_TEMPLATE_PATH:
+            options.append(f"-I{TILELANG_TEMPLATE_PATH}")
+    except Exception:
+        pass
+    try:
+        if CUTLASS_INCLUDE_DIR:
+            options.append(f"-I{CUTLASS_INCLUDE_DIR}")
+    except Exception:
+        pass
+    try:
+        if CUDA_HOME:
+            options.append(f"-I{os.path.join(CUDA_HOME, 'include')}")
+    except Exception:
+        pass
+
+    # Preserve user flags exactly, including repeated tokens required by NVCC
+    # (e.g., multiple "-gencode" pairs or repeated "-Xcompiler" entries).
+    if compile_flags:
+        import shlex
+
+        for flag in compile_flags:
+            # Split each string like a shell would, preserving quoted args
+            tokens = shlex.split(flag) if isinstance(flag, str) else [str(flag)]
+            options.extend(tokens)
+    return options
+
+
+def get_ptx_from_source(code: str, compile_flags: list[str] | None = None, verbose: bool = False) -> str:
+    """
+    Compile CUDA C++ source to PTX using NVCC and return as text.
+
+    Parameters
+    ----------
+    code : str
+        CUDA C++ kernel source code.
+    compile_flags : Optional[List[str]]
+        Additional flags merged with defaults.
+    verbose : bool
+        Print NVCC output when True.
+
+    Returns
+    -------
+    str
+        PTX text.
+    """
+    opts = default_compile_options(compile_flags)
+    ptx_bytes = compile_cuda(code, target_format="ptx", options=opts, verbose=verbose)
+    try:
+        return ptx_bytes.decode("utf-8")
+    except Exception:
+        return str(ptx_bytes)
+
+
+def _find_tool(name: str) -> str | None:
+    """Find a CUDA binary in PATH or under CUDA_HOME/bin."""
+    path = shutil.which(name)
+    if path:
+        return path
+    if CUDA_HOME:
+        candidate = os.path.join(CUDA_HOME, "bin", name)
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def get_sass_from_source(code: str, compile_flags: list[str] | None = None, verbose: bool = False) -> str:
+    """
+    Compile CUDA C++ source to CUBIN and disassemble to SASS.
+
+    Uses nvdisasm if available; otherwise falls back to cuobjdump.
+
+    Parameters
+    ----------
+    code : str
+        CUDA C++ kernel source code.
+    compile_flags : Optional[List[str]]
+        Additional flags merged with defaults.
+    verbose : bool
+        Print tool outputs when True.
+
+    Returns
+    -------
+    str
+        SASS text.
+    """
+    opts = default_compile_options(compile_flags)
+    cubin_bytes = compile_cuda(code, target_format="cubin", options=opts, verbose=verbose)
+
+    # Write to a temp .cubin file
+    with tempfile.NamedTemporaryFile(suffix=".cubin", delete=False) as tmp:
+        tmp.write(cubin_bytes)
+        cubin_path = tmp.name
+
+    # Try disassembly tools (prefer nvdisasm, fallback cuobjdump)
+    cand_nvdisasm = _find_tool("nvdisasm")
+    cand_cuobjdump = _find_tool("cuobjdump")
+    if not cand_nvdisasm and not cand_cuobjdump:
+        raise RuntimeError("Cannot find 'nvdisasm' or 'cuobjdump'. Please ensure CUDA toolkit is installed and in PATH.")
+    last_err: str | None = None
+    try:
+        # Attempt nvdisasm first
+        tools_to_try = []
+        if cand_nvdisasm:
+            tools_to_try.append(("nvdisasm", [cand_nvdisasm, cubin_path]))
+        if cand_cuobjdump:
+            tools_to_try.append(("cuobjdump", [cand_cuobjdump, "--dump-sass", cubin_path]))
+
+        for tool_name, cmd in tools_to_try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            out, _ = proc.communicate()
+            text = py_str(out)
+            if verbose:
+                print(f"[{tool_name}] output:\n{text}")
+            if proc.returncode == 0 and text.strip():
+                return text
+            last_err = f"{tool_name} rc={proc.returncode}, output:\n{text}"
+        # If we reach here, all attempts failed
+        raise RuntimeError(f"SASS disassembly failed. Tried tools: {', '.join(name for name, _ in tools_to_try)}\n{last_err or ''}")
+    finally:
+        with contextlib.suppress(Exception):
+            os.remove(cubin_path)
+
+
 def find_cuda_path():
     """Utility function to find cuda path
-    
+
     Returns
     -------
     path : str
@@ -181,14 +319,7 @@ def get_cuda_version(cuda_path=None):
     raise RuntimeError("Cannot read cuda version file")
 
 
-@tvm._ffi.register_func("tilelang_callback_cuda_compile", override=True)
-def tilelang_callback_cuda_compile(code, target):  # pylint: disable=unused-argument
-    """use nvcc to generate fatbin code for better optimization"""
-    ptx = compile_cuda(code, target_format="fatbin")
-    return ptx
-
-
-@tvm._ffi.register_func("tilelang_callback_libdevice_path", override=True)
+@tvm_ffi.register_global_func("tilelang_callback_libdevice_path", override=True)
 def find_libdevice_path(arch):
     """Utility function to find libdevice
 
@@ -253,7 +384,7 @@ def callback_libdevice_path(arch):
         return ""
 
 
-@tvm._ffi.register_func("tvm.contrib.nvcc.get_compute_version", override=True)
+@tvm_ffi.register_global_func("tvm.contrib.nvcc.get_compute_version", override=True)
 def get_target_compute_version(target=None):
     """Utility function to get compute capability of compilation target.
 
@@ -274,31 +405,26 @@ def get_target_compute_version(target=None):
     # 2. Target.current()
     target = target or Target.current()
     if target and target.arch:
-        arch = target.arch.split("_")[1]
+        arch = target.arch.split("_")[1].rstrip("af")
         if len(arch) == 2:
             major, minor = arch
             # Handle old format like sm_89
             return major + "." + minor
         elif len(arch) == 3:
-            major = int(arch[0])
-            if major < 2:
-                major = arch[0:2]
-                minor = arch[2]
-                return major + "." + minor
-            else:
-                # This is for arch like "sm_90a"
-                major, minor, suffix = arch
-            return major + "." + minor + "." + suffix
+            major = arch[0:2]
+            minor = arch[2]
+            return major + "." + minor
+        else:
+            raise ValueError(f"Unsupported arch: {arch}")
 
     # 3. GPU compute version
     if tvm.cuda(0).exist:
         return tvm.cuda(0).compute_version
 
-    raise ValueError("No CUDA architecture was specified or GPU detected."
-                     "Try specifying it by adding '-arch=sm_xx' to your target.")
+    raise ValueError("No CUDA architecture was specified or GPU detected.Try specifying it by adding '-arch=sm_xx' to your target.")
 
 
-def parse_compute_version(compute_version):
+def parse_compute_version(compute_version) -> tuple[int, int]:
     """Parse compute capability string to divide major and minor version
 
     Parameters
@@ -321,6 +447,17 @@ def parse_compute_version(compute_version):
     except (IndexError, ValueError) as err:
         # pylint: disable=raise-missing-from
         raise RuntimeError("Compute version parsing error") from err
+
+
+def get_target_arch(compute_version: str | tuple[int, int]) -> str:
+    if isinstance(compute_version, str):
+        major, minor = parse_compute_version(compute_version)
+    else:
+        major, minor = compute_version
+    target_arch = str(major * 10 + minor)
+    if major >= 9:
+        target_arch += "a"
+    return target_arch
 
 
 def have_fp16(compute_version):
@@ -372,7 +509,8 @@ def have_tensorcore(compute_version=None, target=None):
                 warnings.warn(
                     "Tensorcore will be disabled due to no CUDA architecture specified."
                     "Try specifying it by adding '-arch=sm_xx' to your target.",
-                    stacklevel=2)
+                    stacklevel=2,
+                )
                 return False
             compute_version = target.attrs["arch"]
             # Compute version will be in the form "sm_{major}{minor}"
@@ -391,7 +529,7 @@ def have_cudagraph():
         return False
 
 
-@tvm._ffi.register_func("tvm.contrib.nvcc.supports_bf16", override=True)
+@tvm_ffi.register_global_func("tvm.contrib.nvcc.supports_bf16", override=True)
 def have_bf16(compute_version):
     """Either bf16 support is provided in the compute capability or not
 
@@ -404,7 +542,7 @@ def have_bf16(compute_version):
     return major >= 8
 
 
-@tvm._ffi.register_func("tvm.contrib.nvcc.supports_fp8", override=True)
+@tvm_ffi.register_global_func("tvm.contrib.nvcc.supports_fp8", override=True)
 def have_fp8(compute_version):
     """Whether fp8 support is provided in the specified compute capability or not
 
@@ -421,7 +559,7 @@ def have_fp8(compute_version):
     return any(conditions)
 
 
-@tvm._ffi.register_func("tvm.contrib.nvcc.supports_tma", override=True)
+@tvm_ffi.register_global_func("tvm.contrib.nvcc.supports_tma", override=True)
 def have_tma(target):
     """Whether TMA support is provided in the specified compute capability or not
 
@@ -430,12 +568,30 @@ def have_tma(target):
     target : tvm.target.Target
         The compilation target
     """
+    if target.kind.name != "cuda":
+        return False
     compute_version = get_target_compute_version(target)
     major, minor = parse_compute_version(compute_version)
     # TMA is supported in Ada Lovelace (9.0) or later architectures.
     conditions = [False]
     conditions.append(major >= 9)
     return any(conditions)
+
+
+def is_hopper(target):
+    if target.kind.name != "cuda":
+        return False
+    compute_version = get_target_compute_version(target)
+    major, minor = parse_compute_version(compute_version)
+    return major == 9 and minor == 0
+
+
+def have_pdl(target):
+    if target.kind.name != "cuda":
+        return False
+    compute_version = get_target_compute_version(target)
+    major, minor = parse_compute_version(compute_version)
+    return major >= 9
 
 
 def get_nvcc_compiler() -> str:

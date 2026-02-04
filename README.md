@@ -13,8 +13,21 @@ Tile Language (**tile-lang**) is a concise domain-specific language designed to 
 <img src=./images/MatmulExample.png />
 
 ## Latest News
-- 05/06/2025 ✨: Added [NVRTC Backend](https://github.com/tile-ai/tilelang/pull/461) to significantly reduce compilation time for cute templates!
-- 14/04/2025 🚀: Added high-performance FlashMLA implementation for AMD MI300X, achieving performance parity with hand-optimized assembly kernels of Aiter! See [example_mla_amd](./examples/deepseek_mla/amd/README.md) for details.
+- 12/18/2025 🚀: Added [CuTeDSL backend](https://github.com/tile-ai/tilelang/pull/1421) support, enabling compilation to NVIDIA CUTLASS CuTe DSL! Join us in building and optimizing this exciting new backend: [Issue #1454](https://github.com/tile-ai/tilelang/issues/1454).
+- 12/17/2025 🔬: Integrated [Z3 theorem prover](https://github.com/tile-ai/tilelang/pull/1367) into TVM Arith Analyzer, bringing SMT-based symbolic reasoning for enhanced optimizations and automatic correctness verification!
+- 10/31/2025 🔧: Migrated to [apache-tvm-ffi](https://github.com/tile-ai/tilelang/pull/1108), significantly reducing CPU overhead!
+- 10/30/2025 📦: We have released v0.1.6.post2, which is the last version compatible with Python 3.8.
+- 10/07/2025 🍎: Added Apple Metal Device support, check out [Pull Request #799](https://github.com/tile-ai/tilelang/pull/799) for details.
+- 09/29/2025  🎉: Thrilled to announce that ​​AscendC​​ and ​Ascend​NPU IR​​ backends targeting Huawei Ascend chips are now supported!
+Check out the preview here:
+🔗 [link](https://github.com/tile-ai/tilelang-ascend).
+This includes implementations across two branches:
+[ascendc_pto](https://github.com/tile-ai/tilelang-ascend) and
+[npuir](https://github.com/tile-ai/tilelang-ascend/tree/npuir).
+Feel free to explore and share your feedback!
+- 07/04/2025 🚀: Introduced `T.gemm_sp` for 2:4 sparse tensor core support, check out [Pull Request #526](https://github.com/tile-ai/tilelang/pull/526) for details.
+- 06/05/2025 ✨: Added [NVRTC Backend](https://github.com/tile-ai/tilelang/pull/461) to significantly reduce compilation time for cute templates!
+- 04/14/2025 🚀: Added high-performance FlashMLA implementation for AMD MI300X, achieving performance parity with hand-optimized assembly kernels of Aiter! See [example_mla_amd](./examples/deepseek_mla/amd/README.md) for details.
 - 03/03/2025 🚀: Added high-performance MLA Decoding support using only 80 lines of Python code, achieving performance on par with FlashMLA on H100 (see [example_mla_decode.py](./examples/deepseek_mla/example_mla_decode.py))! We also provide [documentation](./examples/deepseek_mla/README.md) explaining how TileLang achieves this.
 - 02/15/2025 ✨: Added WebGPU Codegen support, see [Pull Request #86](https://github.com/tile-ai/tilelang/pull/86)!
 - 02/12/2025 ✨: Excited to announce the release of [v0.1.0](https://github.com/tile-ai/tilelang/releases/tag/v0.1.0)!
@@ -32,9 +45,41 @@ Although tile-lang aims to be portable across a range of Devices, it has been sp
 - [Flash Attention](./examples/flash_attention/)
 - [Flash Linear Attention](./examples/linear_attention/)
 - [Flash MLA Decoding](./examples/deepseek_mla/)
-- [Native Sparse Attention](./examples/native_sparse_attention/)
+- [Native Sparse Attention](./examples/deepseek_nsa/)
 
 Within the `examples` directory, you will also find additional complex kernels—such as convolutions, forward/backward passes for FlashAttention, more operators will continuously be added.
+
+## Benchmark Summary
+
+TileLang achieves exceptional performance across a variety of computational patterns. Comprehensive benchmark scripts and settings are available at [tilelang-benchmark](https://github.com/tile-ai/tilelang-benchmark). Below are selected results showcasing its capabilities:
+
+- MLA Decoding Performance on H100
+
+  <div style="display: flex; gap: 10px; justify-content: center;">
+    <div style="flex: 1;">
+      <img src="./examples/deepseek_mla/figures/bs64_float16.png" alt="mla decode performance bs64 on H100" width="100%" />
+    </div>
+    <div style="flex: 1;">
+      <img src="./examples/deepseek_mla/figures/bs128_float16.png" alt="mla decode performance bs128 on H100" width="100%" />
+    </div>
+  </div>
+
+- Flash Attention Performance on H100
+
+  <div align="center">    <img src="./images/mha_performance_h100.png" alt="operator performance on H100" width=80% />
+  </div>
+
+- Matmul Performance on GPUs (RTX 4090, A100, H100, MI300X)
+
+  <div>
+    <img src="./images/op_benchmark_consistent_gemm_fp16.png" alt="gemm fp16 performance on Gpus" />
+  </div>
+
+- Dequantize Matmul Performance on A100
+
+  <div>
+    <img src="./images/op_benchmark_a100_wq_gemv.png" alt="dequantize gemv performance on A100" />
+  </div>
 
 ## Installation
 
@@ -44,9 +89,9 @@ Check out 《曦云系列_通用计算GPU_快速上手指南》 from [Metax deve
 
 ### Build from Source
 We currently provide three ways to install **tile-lang** from source:
- - [Install from Source (using your own TVM installation)](./docs/get_started/Installation.md#method-1-install-from-source-using-your-own-tvm-installation)
- - [Install from Source (using the bundled TVM submodule)](./docs/get_started/Installation.md#method-2-install-from-source-using-the-bundled-tvm-submodule)
- - [Install Using the Provided Script](./docs/get_started/Installation.md#method-3-install-using-the-provided-script)
+- [Install from Source (using your own TVM installation)](./docs/get_started/Installation.md#method-1-install-from-source-using-your-own-tvm-installation)
+- [Install from Source (using the bundled TVM submodule)](./docs/get_started/Installation.md#method-2-install-from-source-using-the-bundled-tvm-submodule)
+- [Install Using the Provided Script](./docs/get_started/Installation.md#method-3-install-using-the-provided-script)
 
 
 ## Quick Start
@@ -60,35 +105,24 @@ Below is an example that demonstrates more advanced features: layout annotation,
 ```python
 import tilelang
 import tilelang.language as T
-# `make_mma_swizzle_layout` is a python defined layout function
-# specifically designed for for MMA operations
-# which ensures the consistency with the nvidia CUTLASS Library.
-# to avoid bank conflicts and maximize the performance.
-from tilelang.intrinsics import (
-    make_mma_swizzle_layout as make_swizzle_layout,)
 
-# add decorator @tilelang.jit if you want to return a torch function
-# @tilelang.jit
-def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float"):
+# @tilelang.jit(target="cuda")
+# target currently can be "cuda" or "hip" or "cpu".
+# if not specified, it will be inferred from the input tensors during compile time
+@tilelang.jit
+def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float):
 
     @T.prim_func
-    def main(
-        A: T.Tensor((M, K), dtype),
-        B: T.Tensor((K, N), dtype),
-        C: T.Tensor((M, N), dtype),
+    def matmul_relu_kernel(
+            A: T.Tensor((M, K), dtype),
+            B: T.Tensor((K, N), dtype),
+            C: T.Tensor((M, N), dtype),
     ):
         # Initialize Kernel Context
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
-            C_local  = T.alloc_fragment((block_M, block_N), accum_dtype)
-
-            # Apply layout optimizations or define your own layout (Optional)
-            # If not specified, we will deduce the layout automatically
-            # T.annotate_layout({
-            #     A_shared: make_swizzle_layout(A_shared),
-            #     B_shared: make_swizzle_layout(B_shared),
-            # })
+            C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
 
             # Enable rasterization for better L2 cache locality (Optional)
             # T.use_swizzle(panel_size=10, enable=True)
@@ -101,53 +135,58 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="flo
                 # This is a sugar syntax for parallelized copy
                 T.copy(A[by * block_M, ko * block_K], A_shared)
 
-                # Demonstrate parallelized copy from global to shared for B
-                for k, j in T.Parallel(block_K, block_N):
-                    B_shared[k, j] = B[ko * block_K + k, bx * block_N + j]
+                # Copy tile of B
+                T.copy(B[ko * block_K, bx * block_N], B_shared)
 
                 # Perform a tile-level GEMM on the shared buffers
                 # Currently we dispatch to the cute/hip on Nvidia/AMD GPUs
                 T.gemm(A_shared, B_shared, C_local)
 
+            # relu
+            for i, j in T.Parallel(block_M, block_N):
+                C_local[i, j] = T.max(C_local[i, j], 0)
+
             # Copy result back to global memory
             T.copy(C_local, C[by * block_M, bx * block_N])
 
-    return main
+    return matmul_relu_kernel
 
 
-# 1. Define the kernel (matmul) with the desired dimensions
-func = matmul(1024, 1024, 1024, 128, 128, 32)
+M = 1024  # M = T.dynamic("m") if you want to use dynamic shape
+N = 1024
+K = 1024
+block_M = 128
+block_N = 128
+block_K = 32
 
-# 2. Compile the kernel into a torch function
-# out_idx specifies the index of the output buffer in the argument list
-# if out_idx is specified, the tensor will be created during runtime
-# target currently can be "cuda" or "hip" or "cpu".
-jit_kernel = tilelang.compile(func, out_idx=[2], target="maca")
+# 1. Define the kernel (matmul) and compile/lower it into an executable module
+matmul_relu_kernel = matmul(M, N, K, block_M, block_N, block_K)
 
 # 3. Test the kernel in Python with PyTorch data
 import torch
 
 # Create random input tensors on the GPU
-a = torch.randn(1024, 1024, device="cuda", dtype=torch.float16)
-b = torch.randn(1024, 1024, device="cuda", dtype=torch.float16)
+a = torch.randn(M, K, device="cuda", dtype=torch.float16)
+b = torch.randn(K, N, device="cuda", dtype=torch.float16)
+c = torch.empty(M, N, device="cuda", dtype=torch.float16)
 
+# Run the kernel through the Profiler
+matmul_relu_kernel(a, b, c)
 
-# Run the kernel through the JIT-compiled function
-c = jit_kernel(a, b)
-
+print(c)
 # Reference multiplication using PyTorch
-ref_c = a @ b
+ref_c = torch.relu(a @ b)
 
 # Validate correctness
 torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
 print("Kernel output matches PyTorch reference.")
 
 # 4. Retrieve and inspect the generated CUDA source (optional)
-cuda_source = jit_kernel.get_kernel_source()
-print("Generated CUDA kernel:\n", cuda_source)
+# cuda_source = matmul_relu_kernel.get_kernel_source()
+# print("Generated CUDA kernel:\n", cuda_source)
 
-# 5.Pofile latency with the profiler
-profiler = jit_kernel.get_profiler()
+# 5.Profile latency with kernel
+profiler = matmul_relu_kernel.get_profiler(tensor_supply_type=tilelang.TensorSupplyType.Normal)
 
 latency = profiler.do_bench()
 
@@ -177,6 +216,6 @@ Welcome to join our Discord community for discussions, support, and collaboratio
 
 [![Join our Discord](https://img.shields.io/badge/Discord-Join%20Us-blue?logo=discord&style=for-the-badge)](https://discord.gg/TUrHyJnKPG)
 
-## Acknowledgements
+## Acknowledgments
 
 We would like to express our gratitude to the [TVM](https://github.com/apache/tvm) community for their invaluable contributions. The initial version of this project was mainly developed by [LeiWang1999](https://github.com/LeiWang1999), [chengyupku](https://github.com/chengyupku) and [nox-410](https://github.com/nox-410) with supervision from Prof. [Zhi Yang](https://yangzhihome.github.io) at Peking University. Part of this work was carried out during an internship at Microsoft Research, where Dr. Lingxiao Ma, Dr. Yuqing Xia, Dr. Jilong Xue, and Dr. Fan Yang offered valuable advice and support. We deeply appreciate their mentorship and contributions.

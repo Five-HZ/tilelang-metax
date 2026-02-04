@@ -22,27 +22,24 @@
  */
 #include "codegen_cpp.h"
 
-#include <tvm/relay/executor.h>
-#include <tvm/relay/runtime.h>
 #include <tvm/runtime/module.h>
 #include <tvm/target/codegen.h>
 
-#include <algorithm>
 #include <string>
 #include <unordered_set>
 #include <utility>
-#include <vector>
 
+#include "../op/builtin.h"
+#include "../support/ffi_aliases.h"
 #include "support/str_escape.h"
 #include "target/build_common.h"
-#include "target/func_registry_generator.h"
 #include "target/source/codegen_params.h"
 
 namespace tvm {
 namespace codegen {
 
 CodeGenTileLangCPP::CodeGenTileLangCPP() {
-  module_name_ = name_supply_->FreshName("__tvm_module_ctx");
+  module_name_ = name_supply_->FreshName("__tvm_ffi_library_ctx");
 }
 
 void CodeGenTileLangCPP::Init(bool output_ssa, bool emit_asserts,
@@ -59,8 +56,7 @@ void CodeGenTileLangCPP::Init(bool output_ssa, bool emit_asserts,
 }
 
 void CodeGenTileLangCPP::InitGlobalContext() {
-  decl_stream << "void* " << tvm::runtime::symbol::tvm_module_ctx
-              << " = NULL;\n";
+  decl_stream << "void* " << ffi::symbol::tvm_ffi_library_ctx << " = NULL;\n";
 }
 
 void CodeGenTileLangCPP::DefineModuleName() {
@@ -208,12 +204,12 @@ void CodeGenTileLangCPP::PrintFuncCall(const std::string &packed_func_name,
   this->PrintIndent();
   std::string ret_val = name_supply_->FreshName("ret_val");
   std::string ret_type_code = name_supply_->FreshName("ret_type_code");
-  this->stream << "TVMValue " << ret_val << ";\n";
+  this->stream << "TVMFFIAny " << ret_val << ";\n";
   this->PrintIndent();
   this->stream << "int " << ret_type_code << ";\n";
   this->PrintIndent();
   this->stream << "if (TVMFuncCall(" << packed_func_name << ", "
-               << "(TVMValue*) stack_value"
+               << "(TVMFFIAny*) stack_value"
                << ", "
                << "(int*) stack_tcode"
                << ", " << num_args << ", "
@@ -233,13 +229,13 @@ void CodeGenTileLangCPP::PrintFuncCallC(
   this->PrintIndent();
   std::string ret_val = name_supply_->FreshName("ret_val");
   std::string ret_type_code = name_supply_->FreshName("ret_type_code");
-  this->stream << "TVMValue " << ret_val << ";\n";
+  this->stream << "TVMFFIAny " << ret_val << ";\n";
   this->PrintIndent();
   this->stream << "int " << ret_type_code << ";\n";
   this->PrintIndent();
 
   this->stream << "if (" << packed_func_name << "( "
-               << "(TVMValue*) stack_value "
+               << "(TVMFFIAny*) stack_value "
                << ", "
                << "(int*) stack_tcode"
                << ", " << num_args << ", "
@@ -261,10 +257,16 @@ void CodeGenTileLangCPP::AddFunction(const PrimFunc &f) {
   // reserve keywords
   ReserveKeywordsAsUnique();
 
-  auto global_symbol = f->GetAttr<String>(tvm::attr::kGlobalSymbol);
-  ICHECK(global_symbol.defined())
+  auto global_symbol = f->GetAttr<ffi::String>(tvm::attr::kGlobalSymbol);
+  ICHECK(global_symbol)
       << "CodeGenC: Expect PrimFunc to have the global_symbol attribute";
   bool no_alias = f->HasNonzeroAttr(tir::attr::kNoAlias);
+  std::unordered_set<const VarNode *> non_restrict;
+  if (auto opt =
+          f->GetAttr<ffi::Array<tir::Var>>(tl::attr::kNonRestrictParams)) {
+    for (const tir::Var &v : opt.value())
+      non_restrict.insert(v.get());
+  }
 
   this->PrintFuncPrefix(stream);
   CodeGenC::PrintType(f->ret_type, stream);
@@ -299,7 +301,7 @@ void CodeGenTileLangCPP::AddFunction(const PrimFunc &f) {
         }
       }
 
-      if (no_alias) {
+      if (no_alias && !non_restrict.count(v.get())) {
         PrintRestrict(v, stream);
       }
     } else {
@@ -384,13 +386,13 @@ void CodeGenTileLangCPP::VisitExpr_(const CallNode *op,
     const std::string &type = op->args[0].as<StringImmNode>()->value;
     const IntImmNode *num = op->args[1].as<IntImmNode>();
     ICHECK(num != nullptr);
-    static_assert(alignof(TVMValue) % alignof(DLTensor) == 0, "invariant");
-    size_t unit = sizeof(TVMValue);
+    static_assert(alignof(TVMFFIAny) % alignof(DLTensor) == 0, "invariant");
+    size_t unit = sizeof(TVMFFIAny);
     size_t size = 0;
     if (type == "shape") {
-      size = (num->value * sizeof(tvm_index_t) + unit - 1) / unit;
+      size = (num->value * sizeof(runtime::tvm_index_t) + unit - 1) / unit;
     } else if (type == "arg_value") {
-      size = (num->value * sizeof(TVMValue) + unit - 1) / unit;
+      size = (num->value * sizeof(TVMFFIAny) + unit - 1) / unit;
     } else if (type == "arg_tcode") {
       size = (num->value * sizeof(int) + unit - 1) / unit;
     } else if (type == "array") {
@@ -399,7 +401,7 @@ void CodeGenTileLangCPP::VisitExpr_(const CallNode *op,
       LOG(FATAL) << "Unknown stack alloca type " << type;
     }
     this->PrintIndent();
-    this->stream << "TVMValue " << stack_name << "[" << size << "];\n";
+    this->stream << "TVMFFIAny " << stack_name << "[" << size << "];\n";
     os << stack_name;
   } else if (op->op.same_as(builtin::tvm_call_packed_lowered())) {
     auto function_info = GetFunctionInfo(op, false /* has_resource_handle */);
@@ -442,7 +444,6 @@ void CodeGenTileLangCPP::VisitStmt_(const AllocateNode *op) {
 
   this->PrintIndent();
   std::string scope = GetPtrStorageScope(op->buffer_var);
-  const VarNode *buffer = op->buffer_var.as<VarNode>();
 
   PrintType(op->dtype, stream);
   size_t constant_size = op->ConstantAllocationSize();

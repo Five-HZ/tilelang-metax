@@ -101,14 +101,15 @@ TL_DEVICE unsigned __pack_half2(const half_t x, const half_t y) {
 }
 
 // Pack two bfloat16_t values.
-TL_DEVICE unsigned __pack_bfloat162(const bfloat16_t x, const bfloat16_t y) {
+TL_DEVICE unsigned __pack_maca_bfloat162(const bfloat16_t x, const bfloat16_t y) {
   unsigned v0 = *((unsigned short *)&x);
   unsigned v1 = *((unsigned short *)&y);
   return (v1 << 16) | v0;
 }
 
 template <typename T1, typename T2>
-TL_DEVICE void AtomicAdd(T1 *address, T2 val) {
+TL_DEVICE void AtomicAdd(T1 *address, T2 val, int memory_order = 0) {
+  (void)memory_order;
   atomicAdd(reinterpret_cast<T1 *>(address), static_cast<T1>(val));
 }
 
@@ -133,6 +134,11 @@ TL_DEVICE int __dp4a(int srcA, int srcB, int c) {
               (signed char)((srcB >> 16) & 0xff), (signed char)((srcB >> 24) & 0xff)};
 
   return v_srca.x * v_srcb.x + v_srca.y * v_srcb.y + v_srca.z * v_srcb.z + v_srca.w * v_srcb.w + c;
+}
+
+// Helper to cast SMEM pointer to unsigned
+TL_DEVICE uint32_t smem_ptr_to_uint(void const *const ptr) {
+  return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
 }
 
 template <typename InDatatype, typename OutDatatype>
@@ -171,6 +177,30 @@ template <int y = 1, typename T> TL_DEVICE T pow_of_int(T x) {
     result *= x;
   }
   return result;
+}
+
+} // namespace tl
+
+//
+// Type-safe warp shuffle helpers for 16-bit float types
+// These wrappers avoid relying on implicit conversions that may be disallowed
+// (e.g., converting float -> mctlass::bfloat16_t) by explicitly promoting to
+// float for the shuffle and then down-converting.
+//
+namespace tl {
+
+// Generic passthroughs
+template <typename T>
+TL_DEVICE T shfl_xor_sync(uint64_t mask, T val, int laneMask) {
+  return __shfl_xor_sync(mask, val, laneMask);
+}
+
+// Specializations for mctlass::half_t
+template <>
+TL_DEVICE half_t shfl_xor_sync(uint64_t mask, half_t val, int laneMask) {
+  float f = static_cast<float>(val);
+  float r = __shfl_xor_sync(mask, f, laneMask);
+  return half_t(r);
 }
 
 } // namespace tl

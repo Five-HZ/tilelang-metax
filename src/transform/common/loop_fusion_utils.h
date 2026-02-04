@@ -45,7 +45,7 @@ class FragmentAccessDetector : public StmtExprVisitor {
 public:
   FragmentAccessDetector() = default;
 
-  void Collect(Stmt stmt) { VisitStmt(stmt); }
+  void Collect(const Stmt &stmt) { VisitStmt(stmt); }
 
   bool HasFragmentAccess() { return has_fragment_access_; }
 
@@ -91,7 +91,7 @@ private:
  */
 class ParallelLoopFuser : public IRMutatorWithAnalyzer {
 public:
-  static Stmt Fuse(Stmt stmt) {
+  static Stmt Fuse(const Stmt &stmt) {
     arith::Analyzer analyzer;
     ParallelLoopFuser substituter(&analyzer);
     return substituter.VisitStmt(stmt);
@@ -99,7 +99,7 @@ public:
 
 private:
   ParallelLoopFuser(arith::Analyzer *analyzer)
-      : IRMutatorWithAnalyzer(analyzer){};
+      : IRMutatorWithAnalyzer(analyzer) {};
 
   Stmt VisitStmt_(const ForNode *op) final {
     // Gather consecutive parallel loops
@@ -218,6 +218,28 @@ private:
     // Create the fused loop
     For fused_for = For(fused_var, 0, fused_extent, ForKind::kParallel, body);
     fused_for.CopyOnWrite()->annotations = op->annotations;
+
+    // If the outermost loop carried a parallel loop layout annotation,
+    // reshape it to the fused 1D domain so the fused loop's layout remains
+    // valid. Using Fragment::Reshape preserves forward_index/thread semantics
+    // and performs necessary simplifications.
+    if (fused_for->annotations.count(attr::kParallelLoopLayout)) {
+      auto old_layout = Downcast<Fragment>(
+          fused_for->annotations.Get(attr::kParallelLoopLayout).value());
+      size_t old_dim = old_layout->InputDim();
+      // Only attempt to fuse when dimensions match the number of fused loops.
+      if (old_dim == loop_chain.size()) {
+        Array<PrimExpr> new_shape = {fused_extent};
+        Fragment fused_layout =
+            Downcast<Fragment>(old_layout->Reshape(new_shape, analyzer_));
+        fused_for.CopyOnWrite()->annotations.Set(attr::kParallelLoopLayout,
+                                                 fused_layout);
+      } else {
+        // Dimension mismatch: drop the stale layout so downstream passes can
+        // re-infer a correct one for the fused loop.
+        fused_for.CopyOnWrite()->annotations.erase(attr::kParallelLoopLayout);
+      }
+    }
     return fused_for;
   }
 };

@@ -1,28 +1,24 @@
 import tilelang
 import tilelang.language as T
 
-tilelang.disable_cache()
-
 
 # add decorator @tilelang.jit if you want to return a torch function
 # @tilelang.jit
-def matmul_warp_specialize_copy_1_gemm_0(M,
-                                         N,
-                                         K,
-                                         block_M,
-                                         block_N,
-                                         block_K,
-                                         dtype="float16",
-                                         accum_dtype="float"):
-
+@tilelang.jit(
+    out_idx=[2],
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+    },
+)
+def matmul_warp_specialize_copy_1_gemm_0(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float32):
     warp_group_num = 2
     threads = 128 * warp_group_num
 
     @T.prim_func
     def main(
-            A: T.Tensor((M, K), dtype),
-            B: T.Tensor((K, N), dtype),
-            C: T.Tensor((M, N), dtype),
+        A: T.Tensor((M, K), dtype),
+        B: T.Tensor((K, N), dtype),
+        C: T.Tensor((M, N), dtype),
     ):
         # Initialize Kernel Context
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
@@ -33,8 +29,10 @@ def matmul_warp_specialize_copy_1_gemm_0(M,
             C_local_g0 = T.alloc_fragment((block_M, block_N // warp_group_num), accum_dtype)
             C_local_g1 = T.alloc_fragment((block_M, block_N // warp_group_num), accum_dtype)
 
-            T.clear(C_local_g0)
-            T.clear(C_local_g1)
+            with T.ws(1):
+                T.clear(C_local_g1)
+            with T.ws(0):
+                T.clear(C_local_g0)
 
             for ko in T.Pipelined(T.ceildiv(K, block_K), num_stages=0):
                 T.copy(A[by * block_M, ko * block_K], A_shared)
@@ -45,8 +43,10 @@ def matmul_warp_specialize_copy_1_gemm_0(M,
                     T.copy(B[ko * block_K, bx * block_N + block_N // warp_group_num], B_shared_g0)
                     T.gemm(A_shared, B_shared_g0, C_local_g0)
 
-            T.copy(C_local_g1, C[by * block_M, bx * block_N])
-            T.copy(C_local_g0, C[by * block_M, bx * block_N + block_N // warp_group_num])
+            with T.ws(1):
+                T.copy(C_local_g1, C[by * block_M, bx * block_N])
+            with T.ws(0):
+                T.copy(C_local_g0, C[by * block_M, bx * block_N + block_N // warp_group_num])
 
     return main
 
@@ -59,21 +59,7 @@ def main():
     block_N = 128
     block_K = 64
 
-    # 1. Define the kernel (matmul) and compile/lower it into an executable module
-    func = matmul_warp_specialize_copy_1_gemm_0(M, N, K, block_M, block_N, block_K)
-    # print(func.script())
-
-    # 2. Compile the kernel into a torch function
-    # out_idx specifies the index of the output buffer in the argument list
-    # if out_idx is specified, the tensor will be created during runtime
-    # target currently can be "cuda" or "hip" or "cpu".
-    jit_kernel = tilelang.compile(
-        func,
-        out_idx=[2],
-        pass_configs={
-            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-            # tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-        })
+    jit_kernel = matmul_warp_specialize_copy_1_gemm_0(M, N, K, block_M, block_N, block_K)
     print(jit_kernel.get_kernel_source())
     # 3. Test the kernel in Python with PyTorch data
     import torch

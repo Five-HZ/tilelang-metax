@@ -22,7 +22,8 @@
  * \brief Lower the special device storage access.
  */
 #include <tvm/arith/analyzer.h>
-#include <tvm/runtime/registry.h>
+#include <tvm/ffi/function.h>
+#include <tvm/ffi/reflection/registry.h>
 #include <tvm/target/target_info.h>
 #include <tvm/tir/buffer.h>
 #include <tvm/tir/builtin.h>
@@ -43,7 +44,8 @@ class StorageAccessInfoLower : public StmtExprMutator {
 public:
   Stmt VisitStmt_(const AllocateNode *op) final {
     auto scope = StorageScope::Create(GetPtrStorageScope(op->buffer_var));
-    if (scope.tag.length() != 0 && scope.tag != ".dyn" && scope.tag != ".var") {
+    if (!scope.tag.empty() && scope.tag != ".dyn" && scope.tag != ".var" &&
+        scope.tag != ".barrier" && scope.tag.find(".descriptor") != 0) {
       auto info = GetMemoryInfo(GetPtrStorageScope(op->buffer_var));
       ICHECK(info.defined())
           << "Cannot find memory info of " << scope.to_string();
@@ -103,8 +105,8 @@ private:
     return AddressOffset(buffer_var, dtype, offset);
   }
 
-  PrimExpr MakeTaggedAccessPtr(DataType ptr_type, Var buffer_var,
-                               DataType dtype, PrimExpr offset,
+  PrimExpr MakeTaggedAccessPtr(DataType ptr_type, const Var &buffer_var,
+                               DataType dtype, const PrimExpr &offset,
                                const MemoryInfo &info) {
     if (ptr_type.is_handle()) {
       ICHECK(info->head_address.defined())
@@ -132,7 +134,7 @@ namespace transform {
 using namespace tir::transform;
 
 Pass LowerDeviceStorageAccessInfo() {
-  auto pass_func = [](PrimFunc f, IRModule m, PassContext ctx) {
+  auto pass_func = [](PrimFunc f, const IRModule &m, const PassContext &ctx) {
     auto *n = f.CopyOnWrite();
     n->body = StorageAccessInfoLower()(std::move(n->body));
     return f;
@@ -141,8 +143,11 @@ Pass LowerDeviceStorageAccessInfo() {
                             {});
 }
 
-TVM_REGISTER_GLOBAL("tl.transform.LowerDeviceStorageAccessInfo")
-    .set_body_typed(LowerDeviceStorageAccessInfo);
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = tvm::ffi::reflection;
+  refl::GlobalDef().def("tl.transform.LowerDeviceStorageAccessInfo",
+                        LowerDeviceStorageAccessInfo);
+}
 
 } // namespace transform
 } // namespace tl

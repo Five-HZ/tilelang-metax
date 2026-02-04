@@ -1,32 +1,16 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership. The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
-
 /*!
  * \file warp_specialized_pipeline.cc
  * \brief Warp specialized Pipeline for cuda GPU (sm90+)
  */
 
+#include <tvm/ffi/reflection/registry.h>
 #include <tvm/tir/analysis.h>
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/op.h>
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
+
+#include <utility>
 
 #include "../op/builtin.h"
 
@@ -35,7 +19,7 @@ namespace tl {
 
 using namespace tir;
 
-bool isGemm(Stmt stmt) {
+bool isGemm(const Stmt &stmt) {
   bool is_gemm = false;
   if (stmt.as<EvaluateNode>()) {
     auto call = Downcast<Evaluate>(stmt)->value.as<CallNode>();
@@ -51,7 +35,7 @@ bool isGemm(Stmt stmt) {
   return is_gemm;
 }
 
-bool isGemmSync(Stmt stmt) {
+bool isGemmSync(const Stmt &stmt) {
   bool is_gemm_sync = false;
   if (stmt.as<EvaluateNode>()) {
     auto call = Downcast<Evaluate>(stmt)->value.as<CallNode>();
@@ -67,7 +51,7 @@ bool isGemmSync(Stmt stmt) {
   return is_gemm_sync;
 }
 
-bool isArriveBarrier(Stmt stmt) {
+bool isArriveBarrier(const Stmt &stmt) {
   bool is_arrive_barrier = false;
   if (stmt.as<EvaluateNode>()) {
     auto call = Downcast<Evaluate>(stmt)->value.as<CallNode>();
@@ -131,7 +115,7 @@ private:
 
   Stmt VisitStmt_(const ForNode *op) final {
     auto order_anno = op->annotations.Get("tl_pipeline_order");
-    if (!order_anno.defined()) {
+    if (!order_anno) {
       return StmtExprMutator::VisitStmt_(op);
     }
 
@@ -234,7 +218,8 @@ private:
         gemm_count++;
       } else if (isGemmSync(new_seq[i])) {
         auto call = Downcast<Evaluate>(new_seq[i])->value.as<CallNode>();
-        auto sync_index = Downcast<IntImm>(call->args[1])->value;
+        auto sync_index =
+            static_cast<int>(Downcast<IntImm>(call->args[1])->value);
         auto wait_count = gemm_count - sync_index - 1;
         if (sync_index > max_sync_index)
           max_sync_index = sync_index;
@@ -275,14 +260,16 @@ private:
 using namespace tir::transform;
 
 tvm::transform::Pass RewriteWgmmaSync() {
-  auto pass_func = [=](PrimFunc f, IRModule m, PassContext ctx) {
-    return WgmmaSyncRewriter::Substitute(f);
+  auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
+    return WgmmaSyncRewriter::Substitute(std::move(f));
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.RewriteWgmmaSync", {});
 }
 
-TVM_REGISTER_GLOBAL("tl.transform.RewriteWgmmaSync")
-    .set_body_typed(RewriteWgmmaSync);
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = tvm::ffi::reflection;
+  refl::GlobalDef().def("tl.transform.RewriteWgmmaSync", RewriteWgmmaSync);
+}
 
 } // namespace tl
 } // namespace tvm

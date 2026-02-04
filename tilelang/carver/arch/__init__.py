@@ -1,17 +1,17 @@
 # 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+from __future__ import annotations
 
 from .arch_base import TileDevice
-from .cuda import CUDA
-from .cpu import CPU
-from .cdna import CDNA
-from .maca import MACA
-from typing import Union
-from tvm import device as tvm_device
+from .cuda import *
+from .cpu import *
+from .cdna import *
+from .metal import *
+from .maca import *
 from tvm.target import Target
-from tvm.runtime import Device
+import torch
 
 
-def get_arch(target: Union[str, Target] = "cuda") -> TileDevice:
+def get_arch(target: str | Target = "cuda") -> TileDevice:
     if isinstance(target, str):
         target = Target(target)
 
@@ -21,36 +21,42 @@ def get_arch(target: Union[str, Target] = "cuda") -> TileDevice:
         return CPU(target)
     elif target.kind.name == "hip":
         return CDNA(target)
+    elif target.kind.name == "metal":
+        return METAL(target)
     elif target.kind.name == "maca":
         return MACA(target)
     else:
         raise ValueError(f"Unsupported target: {target.kind.name}")
 
-AUTO_DETECT_DEVICES = ["maca", "cuda", "rocm", "llvm"]
 
 def auto_infer_current_arch() -> TileDevice:
     # TODO(lei): This is a temporary solution to infer the current architecture
     # Can be replaced by a more sophisticated method in the future
-    def _check_device(device: Device) -> bool:
-        try:
-            return bool(device.exist)
-        except:
-            return False
-    for dev_name in AUTO_DETECT_DEVICES:
-        if _check_device(tvm_device(dev_name)):
-            return get_arch(dev_name)
+    if "metax" in torch.version.__version__:
+        return get_arch("maca")
+    elif torch.version.hip is not None:
+        return get_arch("hip")
+    if torch.cuda.is_available():
+        return get_arch("cuda")
+    elif torch.mps.is_available():
+        return get_arch("metal")
     else:
-        raise ValueError(f"No device found, supported devices: {AUTO_DETECT_DEVICES}")
+        return get_arch("llvm")
 
-from .cpu import is_cpu_arch  # noqa: F401
-from .cuda import (
-    is_cuda_arch,  # noqa: F401
-    is_volta_arch,  # noqa: F401
-    is_ampere_arch,  # noqa: F401
-    is_ada_arch,  # noqa: F401
-    is_hopper_arch,  # noqa: F401
-    is_tensorcore_supported_precision,  # noqa: F401
-    has_mma_support,  # noqa: F401
-)
-from .cdna import is_cdna_arch  # noqa: F401
-from .maca import is_maca_arch
+
+__all__ = [
+    "is_cpu_arch",
+    "is_cuda_arch",
+    "is_volta_arch",
+    "is_ampere_arch",
+    "is_ada_arch",
+    "is_hopper_arch",
+    "is_tensorcore_supported_precision",
+    "has_mma_support",
+    "is_cdna_arch",
+    "is_metal_arch",
+    "CUDA",
+    "CDNA",
+    "METAL",
+    "CPU",
+]

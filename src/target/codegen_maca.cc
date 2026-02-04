@@ -6,7 +6,7 @@
 
 #include "codegen_maca.h"
 #include <tvm/arith/analyzer.h>
-#include <tvm/runtime/registry.h>
+#include <tvm/ffi/function.h>
 #include <tvm/tir/index_map.h>
 #include <tvm/tir/op.h>
 
@@ -16,13 +16,17 @@
 #include <vector>
 
 #include "../op/builtin.h"
-#include "../op/bulk_copy.h"
-#include "target/source/ptx.h"
+#include "../transform/common/attr.h"
+#include "./ptx.h"
+#include "./utils.h"
+#include "arith/pattern_match.h"
 
 namespace tvm {
 namespace codegen {
+using namespace tvm::tl::codegen;
+using namespace ffi;
 
-static std::string GetFP8Type(DataType type) {
+static std::string GetTileLangFP8Type(DataType type) {
   std::stringstream stream;
   int32_t lanes = type.lanes();
   std::string vec;
@@ -36,52 +40,98 @@ static std::string GetFP8Type(DataType type) {
     vec = "_8";
   } else if (lanes == 16) {
     vec = "_16";
+  } else if (lanes == 32) {
+    vec = "_32";
   } else {
-    LOG(FATAL) << "Only support scalar and vector types of width (2, 4, 8, 16) "
-                  "for FP8";
+    LOG(FATAL)
+        << "Only support scalar and vector types of width (2, 4, 8, 16, 32) "
+           "for FP8";
   }
-  if (type.code() == DataType::kFloat8_e4m3fn) {
+  if (type.is_float8_e4m3() || type.is_float8_e4m3fn()) {
     stream << "fp8_e4" << vec << "_t";
-  } else if (type.code() == DataType::kFloat8_e4m3fnuz) {
-    stream << "fp8_e4" << vec << "_t";
-  } else if (type.code() == DataType::kFloat8_e5m2) {
+  } else if (type.is_float8_e5m2()) {
     stream << "fp8_e5" << vec << "_t";
+  } else if (type.is_float8_e8m0fnu()) {
+    stream << "fp8_e8" << vec << "_t";
   } else {
-    LOG(FATAL) << "Unsupported FP8 type in MACA codegen";
+    LOG(FATAL) << "Unsupported FP8 type in MACA codegen but got " << type;
   }
   return stream.str();
 }
 
-/*!
- * \brief Replace patterns with replacement strings.
- * \note should use std::format instead when codebase is ported to C++20.
- */
-class Replacer {
-public:
-  void register_rule(const std::string &pattern,
-                     const std::string &replacement) {
-    _rules.emplace_back(pattern, replacement);
+std::string GetTileLangFP6Type(DataType type) {
+  std::stringstream stream;
+  int32_t lanes = type.lanes();
+  std::string vec;
+  if (type.is_scalar()) {
+    vec = "";
+  } else if (lanes == 2) {
+    vec = "x2";
+  } else if (lanes == 4) {
+    vec = "x4";
+  } else if (lanes == 8) {
+    vec = "x8";
+  } else if (lanes == 16) {
+    vec = "x16";
+  } else {
+    LOG(FATAL)
+        << "Only support scalar and vector types of width (2, 4) for FP6";
   }
-  std::string rewrite(std::string str) {
-    for (auto &&rule : _rules) {
-      auto [pattern, replacement] = rule;
-      size_t len = pattern.size();
-      size_t new_len = replacement.size();
-      size_t pos = str.find(pattern);
-      while (pos != std::string::npos) {
-        str = str.replace(pos, len, replacement);
-        pos = str.find(pattern, pos + new_len);
-      }
-    }
-    return str;
+  stream << "__maca_fp6";
+  std::string suffix;
+  if (type.code() == DataType::kFloat6_e2m3fn) {
+    suffix = "_e2m3";
+  } else if (type.code() == DataType::kFloat6_e3m2fn) {
+    suffix = "_e3m2";
+  } else {
+    LOG(FATAL) << "Unsupported FP6 type in MACA codegen";
   }
-  void empty_rules() { _rules.clear(); }
+  stream << vec << suffix;
+  return stream.str();
+}
 
-private:
-  std::vector<std::pair<std::string, std::string>> _rules;
-};
+std::string GetTileLangFP4Type(DataType type) {
+  std::stringstream stream;
+  int32_t lanes = type.lanes();
+  std::string vec;
+  if (type.is_scalar()) {
+    vec = "";
+  } else if (lanes == 2) {
+    vec = "_2";
+  } else if (lanes == 4) {
+    vec = "_4";
+  } else if (lanes == 8) {
+    vec = "_8";
+  } else if (lanes == 16) {
+    vec = "_16";
+  } else if (lanes == 32) {
+    vec = "_32";
+  } else if (lanes == 64) {
+    vec = "_64";
+  } else {
+    LOG(FATAL) << "Only support scalar and vector types of width (2, 4, 8, 16, "
+                  "32, 64) for FP4";
+  }
 
-CodeGenTileLangMACA::CodeGenTileLangMACA() { restrict_keyword_ = "__restrict__"; }
+  std::string suffix;
+  if (type.code() == DataType::kFloat4_e2m1fn) {
+    suffix = "_e2";
+  } else {
+    LOG(FATAL) << "Unsupported FP4 type in MACA codegen";
+  }
+
+  stream << "fp4" << suffix << vec << "_t";
+  return stream.str();
+}
+
+CodeGenTileLangMACA::CodeGenTileLangMACA() {
+  restrict_keyword_ = "__restrict__";
+  vid_global_barrier_state_ =
+      name_supply_->FreshName(runtime::symbol::tvm_global_barrier_state);
+  vid_global_barrier_expect_ = name_supply_->FreshName("__barrier_expect");
+  ICHECK_EQ(vid_global_barrier_state_,
+            runtime::symbol::tvm_global_barrier_state);
+}
 
 void CodeGenTileLangMACA::PrintFuncPrefix(std::ostream &os) {
   os << "extern \"C\" __global__ ";
@@ -112,7 +162,7 @@ public:
   PrimExpr threadIdx_z_ext = Integer(1);
 };
 
-void CodeGenTileLangMACA::PrintExtraAttrs(const PrimFunc &f, std::ostream &os) {
+void CodeGenTileLangMACA::PrintExtraAttrs(const PrimFunc &f) {
   LaunchConfigExtractor extractor;
   extractor(f->body);
   arith::Analyzer analyzer;
@@ -131,45 +181,71 @@ void CodeGenTileLangMACA::PrintExtraAttrs(const PrimFunc &f, std::ostream &os) {
 }
 
 std::string CodeGenTileLangMACA::Finish() {
-  // maca must need a header file.
-  decl_stream << "#include <mcr/mc_runtime.h>\n";
   if (need_mma_h_) {
     decl_stream << "#include <mma.h>\n";
   }
-
-
-  decl_stream << "#include <tl_templates/maca/gemm.h>\n";
-  // decl_stream << "#include <tl_templates/maca/copy.h>\n";
-  decl_stream << "#include <tl_templates/maca/reduce.h>\n";
-  // decl_stream << "#include <tl_templates/maca/ldsm.h>\n";
-  decl_stream << "#include <tl_templates/maca/threadblock_swizzle.h>\n";
-  decl_stream << "#include <tl_templates/maca/debug.h>\n";
-  decl_stream << "\n";
-
+  if (need_mma_instruction_h_) {
+    decl_stream << "#include <tl_templates/maca/instruction/mma.h>\n";
+  }
+  if (need_wgmma_instruction_h_) {
+    decl_stream << "#include <tl_templates/maca/instruction/wgmma.h>\n";
+  }
+  if (need_tcgen05mma_instruction_h_) {
+    decl_stream << "#include <tl_templates/maca/instruction/tcgen05mma.h>\n";
+  }
+  if (need_mma_sm70_instruction_h_) {
+    decl_stream << "#include <tl_templates/maca/instruction/mma_sm70.h>\n";
+  }
+  if (need_tcgen05_common_h_) {
+    decl_stream << "#include <tl_templates/maca/tcgen_05.h>\n";
+  }
   if (enable_fp8_) {
     decl_stream << "#include <tl_templates/maca/maca_fp8.h>\n";
-    decl_stream << "\n";
-    decl_stream << R"(
-template <> struct tl::MfmaTraits<__maca_fp8_e4m3> {
-  template <typename AccType>
-  static TL_DEVICE void mfma_op(const __maca_fp8_e4m3 *b, const __maca_fp8_e4m3 *a,
-                                AccType *c) {
-    int *b_int = (int *)b;
-    int *a_int = (int *)a;
-    typedef __attribute__((__vector_size__(4 * sizeof(float)))) float v4f;
-    v4f *c_vec = reinterpret_cast<v4f*>(c);
-    *c_vec = __builtin_mxc_mma_f32_16x16x16f8_e4m3(*b_int, *a_int, *c_vec);
   }
-};)";
-    decl_stream << "\n";
+  if (enable_fp4_) {
+    decl_stream << "#include <tl_templates/maca/maca_fp4.h>\n";
   }
+
+  if (need_cooperative_groups_) {
+    decl_stream << "#include <maca_cooperative_groups.h>\n";
+  }
+
+  if (need_mcrand_kernel_h_) {
+    decl_stream << "#include <mcrand/mcrand_kernel.h>\n";
+  }
+
+  decl_stream << "#include <tl_templates/maca/gemm.h>\n";
+  if (enable_sparse_gemm_) {
+    decl_stream << "#include <tl_templates/maca/gemm_sp.h>\n";
+  }
+  // TODO: Add implementation for maca target.
+  // decl_stream << "#include <tl_templates/maca/copy.h>\n";
+  decl_stream << "#include <tl_templates/maca/reduce.h>\n";
+  decl_stream << "#include <tl_templates/maca/ldsm.h>\n";
+  decl_stream << "#include <tl_templates/maca/threadblock_swizzle.h>\n";
+  // decl_stream << "#include <tl_templates/maca/debug.h>\n";
+  // decl_stream << "#ifdef ENABLE_BF16\n";
+  // decl_stream << "#include <tl_templates/maca/maca_bf16_fallbacks.cuh>\n";
+  // decl_stream << "#endif\n";
+
+  if (need_global_barrier_) {
+    decl_stream << "__device__ unsigned " << vid_global_barrier_state_
+                << " = 0;\n";
+  }
+  decl_stream << "\n";
+
   return CodeGenC::Finish();
 }
 
 void CodeGenTileLangMACA::VisitStmt_(const tir::ForNode *op) {
   if (op->kind == tir::ForKind::kUnrolled) {
     PrintIndent();
-    stream << "#pragma unroll\n";
+    if (unroll_factor.count(op->loop_var.get())) {
+      stream << "#pragma unroll "
+             << PrintExpr(unroll_factor[op->loop_var.get()]) << "\n";
+    } else {
+      stream << "#pragma unroll\n";
+    }
   }
   std::string extent =
       PrintExpr(arith::Analyzer().Simplify(op->extent + op->min));
@@ -218,7 +294,7 @@ void CodeGenTileLangMACA::PrintType(DataType t, std::ostream &os) { // NOLINT(*)
       if (t.is_scalar()) {
         os << "half_t";
       } else if (lanes <= 8) {
-        // Emit CUDA code to access fp16 vector elements.
+        // Emit MACA code to access fp16 vector elements.
         //
         // half4 is stored as uint2
         //
@@ -237,7 +313,7 @@ void CodeGenTileLangMACA::PrintType(DataType t, std::ostream &os) { // NOLINT(*)
       if (lanes <= 4) {
         os << "float";
       } else if (lanes <= 8) {
-        // Emit CUDA code to access fp32 vector elements for 4 < lanes <= 8.
+        // Emit MACA code to access fp32 vector elements for 4 < lanes <= 8.
         //
         // float8 is stored as ulonglong4
         //
@@ -267,11 +343,16 @@ void CodeGenTileLangMACA::PrintType(DataType t, std::ostream &os) { // NOLINT(*)
       return;
     }
   } else if (t.is_bfloat16()) {
+    enable_bf16_ = true;
     if (t.is_scalar()) {
       os << "bfloat16_t";
     } else if (lanes <= 8) {
       ICHECK_EQ(lanes % 2, 0) << "only support even lane for half type";
       os << "uint" << lanes / 2;
+    } else if (lanes <= 16) {
+      ICHECK_EQ(lanes % 4, 0) << "only support (mod 4 = 0) lanes for half type "
+                                 "of more than 8 lanes";
+      os << "ulonglong" << lanes / 4;
     } else {
       fail = true;
     }
@@ -279,13 +360,27 @@ void CodeGenTileLangMACA::PrintType(DataType t, std::ostream &os) { // NOLINT(*)
       return;
   } else if (t.is_float8()) {
     enable_fp8_ = true;
-    os << GetFP8Type(t);
+    os << GetTileLangFP8Type(t);
+    return;
+  } else if (t.is_float6()) {
+    enable_fp6_ = true;
+    if (t.lanes() <= 4) {
+      os << GetTileLangFP6Type(t);
+    }
+    return;
+  } else if (t.is_float4()) {
+    enable_fp4_ = true;
+    if (t.lanes() <= 64) {
+      os << GetTileLangFP4Type(t);
+    } else {
+      fail = true;
+    }
     return;
   } else if (t == DataType::Bool()) {
     os << "bool";
     return;
   } else if (t.is_vector_bool()) {
-    // CUDA does not support bool vectors.
+    // MACA does not support bool vectors.
     // Use ushort vectors to represent instead.
     int n = t.lanes();
     if (n <= 4) {
@@ -311,7 +406,7 @@ void CodeGenTileLangMACA::PrintType(DataType t, std::ostream &os) { // NOLINT(*)
         os << "int";
         return;
       } else {
-        LOG(FATAL) << "Cannot convert type " << t << " to CUDA type!";
+        LOG(FATAL) << "Cannot convert type " << t << " to MACA type!";
       }
     }
     case 4: {
@@ -335,12 +430,13 @@ void CodeGenTileLangMACA::PrintType(DataType t, std::ostream &os) { // NOLINT(*)
         os << "int8";
         return;
       } else {
-        LOG(FATAL) << "Cannot convert type " << t << " to CUDA type!";
+        LOG(FATAL) << "Cannot convert type " << t << " to MACA type!";
       }
     }
     case 8: {
       if (t.lanes() == 4) {
         // directly 4 8 bit int in integer.
+        enable_int8_ = true;
 
         // We use int for int8x4 instead of char4 because using char4 is
         // likely to produce extra instructions to pack four int8 elements
@@ -348,10 +444,16 @@ void CodeGenTileLangMACA::PrintType(DataType t, std::ostream &os) { // NOLINT(*)
         os << "int";
         return;
       } else if (t.lanes() == 8) {
+        enable_int8_ = true;
         os << "int2";
         return;
       } else if (t.lanes() == 16) {
+        enable_int8_ = true;
         os << "int4";
+        return;
+      } else if (t.lanes() == 32) {
+        enable_int8_ = true;
+        os << "longlong4";
         return;
       } else if (!t.is_uint() && t.is_scalar()) {
         os << "signed char";
@@ -367,7 +469,7 @@ void CodeGenTileLangMACA::PrintType(DataType t, std::ostream &os) { // NOLINT(*)
       } else if (t.lanes() <= 4) {
         os << "short" << lanes;
       } else if (t.lanes() <= 8) {
-        // Emit CUDA code to access int16 vector elements.
+        // Emit MACA code to access int16 vector elements.
         //
         // short4 is stored as int2
         //
@@ -393,7 +495,7 @@ void CodeGenTileLangMACA::PrintType(DataType t, std::ostream &os) { // NOLINT(*)
       } else if (t.lanes() <= 4) {
         os << "int" << t.lanes();
       } else if (t.lanes() <= 8) {
-        // Emit CUDA code to access int32 vector elements for 4 < lanes <= 8.
+        // Emit MACA code to access int32 vector elements for 4 < lanes <= 8.
         //
         // int8 is stored as longlong4
         //
@@ -420,8 +522,13 @@ void CodeGenTileLangMACA::PrintType(DataType t, std::ostream &os) { // NOLINT(*)
         os << "longlong3";
       } else if (t.lanes() == 4) {
         os << "longlong4";
+      } else {
+        fail = true;
       }
-      return;
+      if (!fail) {
+        return;
+      }
+      break;
     }
     default:
       fail = true;
@@ -435,12 +542,12 @@ void CodeGenTileLangMACA::PrintType(DataType t, std::ostream &os) { // NOLINT(*)
       return;
     }
   }
-  LOG(FATAL) << "Cannot convert type " << t << " to CUDA type";
+  LOG(FATAL) << "Cannot convert type " << t << " to MACA type";
 }
 
 void CodeGenTileLangMACA::PrintVecBinaryOp(const std::string &op, DataType t,
-                                          PrimExpr lhs, PrimExpr rhs,
-                                          std::ostream &os) { // NOLINT(*)
+                                           PrimExpr lhs, PrimExpr rhs,
+                                           std::ostream &os) { // NOLINT(*)
   // Declare the result.
   std::string sret = name_supply_->FreshName("_");
   this->PrintIndent();
@@ -475,33 +582,77 @@ void CodeGenTileLangMACA::PrintVecBinaryOp(const std::string &op, DataType t,
 }
 
 void CodeGenTileLangMACA::PrintVecElemLoad(const std::string &vec, DataType t,
-                                          int i,
-                                          std::ostream &os) { // NOLINT(*)
+                                           int i,
+                                           std::ostream &os) { // NOLINT(*)
   if (t.is_scalar()) {
     os << vec;
     return;
   }
 
   static const char access[] = {'x', 'y', 'z', 'w'};
-  ICHECK(i >= 0 && i < (t.bits() == 8                        ? 16
-                        : (t.bits() == 16 || t.bits() == 32) ? 8
-                                                             : 4));
+  ICHECK(i >= 0 && i < 256 / t.bits())
+      << "i: " << i << " t: " << t << " t.bits(): " << t.bits()
+      << " t.lanes(): " << t.lanes();
   if (t.bits() == 8 && (t.is_int() || t.is_uint())) {
     std::string type_name = t.is_int() ? "char" : "unsigned char";
     if (t.lanes() == 2 || t.lanes() == 3) {
       os << vec << "." << access[i % t.lanes()];
-    } else {
+    } else if (t.lanes() <= 16) {
       std::string ac = t.lanes() == 4 ? vec : (vec + "." + access[i / 4]);
       os << "((" << type_name << ")(" << ac << " >> " << i % 4 * 8 << "))";
+    } else {
+      ICHECK(t.lanes() == 32);
+      std::string ac = vec + "." + access[i / 8];
+      os << "((" << type_name << ")(" << ac << " >> " << i % 8 * 8 << "))";
     }
   } else if (t.is_float16()) {
-    os << "((half2*)(&(" << vec << "." << access[i / 2] << ")))->"
-       << access[i % 2];
+    if (t.lanes() <= 8) {
+      os << "((half2*)(&(" << vec << "." << access[i / 2] << ")))->"
+         << access[i % 2];
+    } else {
+      os << "(((half2*)(&(" << vec << "." << access[i / 4] << "))) + "
+         << (i / 2 % 2) << ")->" << access[i % 2];
+    }
   } else if (t.is_bfloat16()) {
-    os << "((nv_bfloat162*)(&(" << vec << "." << access[i / 2] << ")))->"
-       << access[i % 2];
-  } else if (t.is_float8_e4m3fn()) {
+    if (t.lanes() <= 8) {
+      os << "((maca_bfloat162*)(&(" << vec << "." << access[i / 2] << ")))->"
+         << access[i % 2];
+    } else {
+      os << "(((maca_bfloat162*)(&(" << vec << "." << access[i / 4] << "))) + "
+         << (i / 2 % 2) << ")->" << access[i % 2];
+    }
+  } else if (t.is_float8()) {
     os << vec;
+    // fp8_e5_32_t
+    if (t.lanes() >= 32)
+      os << "." << access[i / 16];
+    // fp8_e5_16_t
+    if (t.lanes() >= 16)
+      os << "." << access[(i % 16) / 8];
+    // fp8_e5_8_t
+    if (t.lanes() >= 8)
+      os << "." << access[(i % 8) / 4];
+    // fp8_e5_4_t or fp8_e5_2_t
+    os << "." << access[i % 4];
+  } else if (t.is_float4_e2m1fn()) {
+    os << vec;
+    // fp4_e2_64_t
+    if (t.lanes() >= 64)
+      os << "." << access[i / 32];
+    // fp4_e2_32_t
+    if (t.lanes() >= 32)
+      os << "." << access[(i % 32) / 16];
+    // fp4_e2_16_t
+    if (t.lanes() >= 16)
+      os << "." << access[(i % 16) / 8];
+    // fp4_e2_8_t
+    if (t.lanes() >= 8)
+      os << "." << access[(i % 8) / 4];
+    // fp4_e2_4_t -> fp4_e2_2_t member
+    if (t.lanes() >= 4)
+      os << "." << access[(i % 4) / 2];
+    // fp4_e2_2_t -> method call x() or y()
+    os << "." << access[i % 2] << "()";
   } else if (t.lanes() > 4 && t.lanes() <= 8) {
     std::string type_name;
     if (t.bits() == 16) {
@@ -528,17 +679,15 @@ void CodeGenTileLangMACA::PrintVecElemLoad(const std::string &vec, DataType t,
 }
 
 void CodeGenTileLangMACA::PrintVecElemStore(const std::string &vec, DataType t,
-                                           int i, const std::string &value) {
+                                            int i, const std::string &value) {
   this->PrintIndent();
   static const char access[] = {'x', 'y', 'z', 'w'};
-  ICHECK(i >= 0 && i < (t.bits() == 8                        ? 16
-                        : (t.bits() == 16 || t.bits() == 32) ? 8
-                                                             : 4));
+  ICHECK(i >= 0 && i < 256 / t.bits());
   if (t.bits() == 8 && (t.is_int() || t.is_uint())) {
     if (t.lanes() == 2 || t.lanes() == 3) {
       stream << vec << '.' << access[i % t.lanes()] << "="
              << "(" << value << ");\n";
-    } else {
+    } else if (t.lanes() <= 16) {
       std::string ac = t.lanes() == 4 ? vec : (vec + "." + access[i / 4]);
       stream << ac << "=";
       // Do not read the first undef lane.
@@ -546,13 +695,47 @@ void CodeGenTileLangMACA::PrintVecElemStore(const std::string &vec, DataType t,
         stream << ac << " & ~(0x000000ff << " << i % 4 * 8 << ") |";
       }
       stream << "(" << value << " << " << i % 4 * 8 << ");\n";
+    } else {
+      ICHECK(t.lanes() == 32);
+      std::string ac = vec + "." + access[i / 8];
+      stream << ac << "=";
+      // Do not read the first undef lane.
+      if (i != 0) {
+        stream << ac << " & ~(0x000000ff << " << i % 8 * 8 << ") |";
+      }
+      stream << "(" << value << " << " << i % 8 * 8 << ");\n";
     }
   } else if (t.is_float16()) {
-    stream << "*((half_t*)(&(((half2*)(&(" << vec << "." << access[i / 2]
-           << ")))->" << access[i % 2] << "))) = " << value << ";\n";
+    if (t.lanes() <= 8) {
+      stream << "((half2*)(&(" << vec << "." << access[i / 2] << ")))->"
+             << access[i % 2] << " = " << value << ";\n";
+    } else {
+      stream << "(((half2*)(&(" << vec << "." << access[i / 4] << "))) + "
+             << (i / 2 % 2) << ")->" << access[i % 2] << " = " << value
+             << ";\n";
+    }
   } else if (t.is_bfloat16()) {
-    stream << "((bfloat16_t*)(&(" << vec << "." << access[i / 2] << ")))["
-           << (i % 2) << "] = " << value << ";\n";
+    if (t.lanes() <= 8) {
+      stream << "((maca_bfloat162*)(&(" << vec << "." << access[i / 2] << ")))->"
+             << access[i % 2] << " = " << value << ";\n";
+    } else {
+      stream << "(((maca_bfloat162*)(&(" << vec << "." << access[i / 4]
+             << "))) + " << (i / 2 % 2) << ")->" << access[i % 2] << " = "
+             << value << ";\n";
+    }
+  } else if (t.is_float8()) {
+    stream << vec;
+    // fp8_e5_32_t
+    if (t.lanes() >= 32)
+      stream << "." << access[i / 16];
+    // fp8_e5_16_t
+    if (t.lanes() >= 16)
+      stream << "." << access[(i % 16) / 8];
+    // fp8_e5_8_t
+    if (t.lanes() >= 8)
+      stream << "." << access[(i % 8) / 4];
+    // fp8_e5_4_t or fp8_e5_2_t
+    stream << "." << access[i % 4] << " = " << value << ";\n";
   } else if (t.lanes() > 4 && t.lanes() <= 8) {
     std::string type_name;
     if (t.bits() == 16) {
@@ -573,27 +756,88 @@ void CodeGenTileLangMACA::PrintVecElemStore(const std::string &vec, DataType t,
     ICHECK(!type_name.empty());
     stream << "((" << type_name << "2*)(&(" << vec << "." << access[i / 2]
            << ")))->" << access[i % 2] << " = " << value << ";\n";
+  } else if (t.is_float4_e2m1fn()) {
+    stream << vec;
+    // fp4_e2_64_t
+    if (t.lanes() >= 64)
+      stream << "." << access[i / 32];
+    // fp4_e2_32_t
+    if (t.lanes() >= 32)
+      stream << "." << access[(i % 32) / 16];
+    // fp4_e2_16_t
+    if (t.lanes() >= 16)
+      stream << "." << access[(i % 16) / 8];
+    // fp4_e2_8_t
+    if (t.lanes() >= 8)
+      stream << "." << access[(i % 8) / 4];
+    // fp4_e2_4_t -> fp4_e2_2_t member
+    if (t.lanes() >= 4)
+      stream << "." << access[(i % 4) / 2];
+    // fp4_e2_2_t -> set_x() or set_y()
+    stream << ".set_" << access[i % 2] << "(" << value << ");\n";
   } else {
     stream << vec << "." << access[i] << " = " << value << ";\n";
   }
 }
 
 void CodeGenTileLangMACA::PrintStorageSync(const CallNode *op) {
+  auto args = op->args;
   const std::string &sync = op->args[0].as<StringImmNode>()->value;
   if (sync == "warp") {
     // DO nothing.
   } else if (sync == "shared" || sync == "shared.dyn") {
     this->PrintIndent();
-    this->stream << "__builtin_mxc_arrive_bsmcnt(0);\n";
+    if (args.size() == 1) {
+      this->stream << "__syncthreads();\n";
+    } else if (args.size() == 2) {
+      auto barrier_id = args[1].as<IntImmNode>()->value;
+      this->stream << "tl::__sync_thread_partial<" << barrier_id << ">();\n";
+    } else if (args.size() == 3) {
+      auto barrier_id = args[1].as<IntImmNode>()->value;
+      auto thread_count = args[2].as<IntImmNode>()->value;
+      this->stream << "tl::__sync_thread_partial<" << barrier_id << ", "
+                   << thread_count << ">();\n";
+    } else {
+      LOG(FATAL) << "Invalid number of arguments for storage sync: "
+                 << args.size();
+    }
+  } else if (sync == "global") {
+    if (!need_global_barrier_) {
+      need_global_barrier_ = true;
+    }
+    // global synchronizer
+    std::string is_load = PrintExpr(op->args[1]);
+    std::string num_blocks = PrintExpr(op->args[2]);
     this->PrintIndent();
-    this->stream << "__builtin_mxc_barrier_inst();\n";
+    // In theory only threadfence is needed
+    // but we observed problems with only threadfence
+    this->stream << "__threadfence_system();\n";
+    this->PrintIndent();
+    this->stream << "if (" << is_load << ") {\n";
+    int wb = this->BeginScope();
+    this->PrintIndent();
+    this->stream << "atomicAdd(&" << vid_global_barrier_state_ << ", 1);\n";
+    this->PrintIndent();
+    std::string ptr = name_supply_->FreshName("pf");
+    this->stream << "volatile unsigned* " << ptr << " = &"
+                 << vid_global_barrier_state_ << ";\n";
+    this->PrintIndent();
+    this->stream << vid_global_barrier_expect_ << " += " << num_blocks << ";\n";
+    this->PrintIndent();
+    this->stream << "while (" << ptr << "[0] < " << vid_global_barrier_expect_
+                 << ");\n";
+    this->EndScope(wb);
+    this->PrintIndent();
+    this->stream << "}\n";
+    this->PrintIndent();
+    this->stream << "__syncthreads();\n";
   }
 }
 
 void CodeGenTileLangMACA::PrintStorageScope(const std::string &scope,
-                                           std::ostream &os) { // NOLINT(*)
+                                            std::ostream &os) { // NOLINT(*)
   ICHECK_NE(scope, "global")
-      << "Cannot allocate global memory when targeting CUDA. You must pass "
+      << "Cannot allocate global memory when targeting MACA. You must pass "
          "all global arrays as input instead";
   if (scope == "shared") {
     os << "__shared__ ";
@@ -603,7 +847,7 @@ void CodeGenTileLangMACA::PrintStorageScope(const std::string &scope,
 }
 
 std::string CodeGenTileLangMACA::CastFromTo(std::string value, DataType from,
-                                           DataType target) {
+                                            DataType target) {
   if (from == target)
     return value;
   std::ostringstream os;
@@ -617,6 +861,9 @@ std::string CodeGenTileLangMACA::CastFromTo(std::string value, DataType from,
       os << "u";
     }
     os << "int)";
+  }
+  if ((from.is_float16() || from.is_bfloat16()) && target.is_float8()) {
+    os << "(float)";
   }
   os << value << ")";
   return os.str();
@@ -637,35 +884,306 @@ void CodeGenTileLangMACA::VisitExpr_(const CastNode *op, std::ostream &os) {
   this->PrintIndent();
   this->PrintType(target_ty, stream);
   stream << ' ' << sret << ";\n";
-  {
-    std::string src = SSAGetID(PrintExpr(op->value), from_ty);
-    if  (target_ty.is_float8_e4m3fn()) {
-      this->PrintIndent();
-      stream << sret << " " << " = __maca_fp8x4_e4m3(" << src << ");\n";   //__1  = __maca_fp8x4_e4m3((fp8_e4_t)(v_.x));
-    } else {
-      for (int i = 0, lanes = from_ty.lanes(); i < lanes; ++i) {
-        std::ostringstream val;
-        if (from_ty.is_float() && target_ty.is_float16()) {
-          val << "__float2half";
-        } else {
-          val << "(";
-          PrintType(target_ty.element_of(), val);
-          val << ")";
+  std::string src = SSAGetID(PrintExpr(op->value), from_ty);
+
+  int lanes = from_ty.lanes();
+
+  auto PrintVectorizedCast =
+      [&](const std::string &cast_func, const std::string &src_type,
+          const std::string &dst_type, const std::string &extra_args = "",
+          bool src_needs_reinterpret = false,
+          bool dst_needs_reinterpret = false) {
+        int num_chunks = lanes / 2;
+        std::string src_cast = src_needs_reinterpret
+                                   ? "reinterpret_cast<" + src_type + "*>"
+                                   : "(" + src_type + "*)";
+        std::string dst_cast = dst_needs_reinterpret
+                                   ? "reinterpret_cast<" + dst_type + "*>"
+                                   : "(" + dst_type + "*)";
+
+        for (int i = 0; i < num_chunks; i++) {
+          PrintIndent();
+          stream << "(" << dst_cast << "(&" << sret << "))[" << i
+                 << "] = " << cast_func << "((" << src_cast << "(&" << src
+                 << "))[" << i << "]" << extra_args << ");\n";
         }
-        val << "(";
-        PrintVecElemLoad(src, from_ty, i, val);
-        val << ")";
-        PrintVecElemStore(sret, target_ty, i, val.str());
-      }
+        os << sret;
+      };
+
+  // A list of casting functions that are supported by TileLang templates.
+  // To add a new type conversion, you should do the following things:
+  // 1. Add the new conversion function in tl_templates. (__tl_cvt_xx)
+  // 2. Add a new if statement like the one below.
+  // 3. In src/target/utils.cc, allow this vectorizable cast.
+
+  // Handle conversion from float16 to float32
+  if (from_ty.is_float16() && target_ty.is_float() && target_ty.bits() == 32) {
+    // Use __half22float2 for vectorized conversion (half2 -> float2)
+    if (lanes == 2 || lanes == 4 || lanes == 8) {
+      PrintVectorizedCast("__half22float2", "half2", "float2");
+      return;
+    }
   }
+
+  // Handle conversion from float32 to float16
+  if (from_ty.is_float() && from_ty.bits() == 32 && target_ty.is_float16()) {
+    // Use __float22half2_rn for vectorized conversion (float2 -> half2)
+    if (lanes == 2 || lanes == 4 || lanes == 8) {
+      PrintVectorizedCast("__float22half2_rn", "float2", "half2");
+      return;
+    }
   }
+
+  // Handle conversion from bfloat16 to float32
+  if (from_ty.is_bfloat16() && target_ty.is_float() && target_ty.bits() == 32) {
+    // Use __bfloat1622float2 for vectorized conversion (bfloat162 -> float2)
+    if (lanes == 2 || lanes == 4 || lanes == 8) {
+      PrintVectorizedCast("__bfloat1622float2", "__maca_bfloat162", "float2", "",
+                          true, false);
+      return;
+    }
+  }
+
+  // Handle conversion from float32 to bfloat16
+  if (from_ty.is_float() && from_ty.bits() == 32 && target_ty.is_bfloat16()) {
+    // Use __float22bfloat162_rn for vectorized conversion (float2 -> bfloat162)
+    if (lanes == 2 || lanes == 4 || lanes == 8) {
+      PrintVectorizedCast("__float22bfloat162_rn", "float2", "__maca_bfloat162",
+                          "", false, true);
+      return;
+    }
+  }
+
+  // Handle conversion from float32 to float8 (E4M3/E5M2)
+  if (from_ty.is_float() && from_ty.bits() == 32 &&
+      tl::IsCudaVectorizableFP8(target_ty)) {
+    bool target_type_is_e4m3 =
+        target_ty.is_float8_e4m3() || target_ty.is_float8_e4m3fn();
+    std::string type_suffix = target_type_is_e4m3 ? "__MACA_E4M3" : "__MACA_E5M2";
+
+    // Use __maca_cvt_float2_to_fp8x2 for vectorized conversion (float2 -> fp8x2)
+    if (lanes == 2 || lanes == 4 || lanes == 8) {
+      std::string extra_args = ", __MACA_SATFINITE, " + type_suffix;
+      PrintVectorizedCast("__maca_cvt_float2_to_fp8x2", "float2",
+                          "__maca_fp8x2_storage_t", extra_args, false, true);
+      return;
+    }
+  }
+
+  // Handle conversion from float8 (E4M3/E5M2) to float32
+  if (tl::IsCudaVectorizableFP8(from_ty) && target_ty.is_float() &&
+      target_ty.bits() == 32) {
+    bool from_type_is_e4m3 =
+        from_ty.is_float8_e4m3() || from_ty.is_float8_e4m3fn();
+    std::string type_suffix = from_type_is_e4m3 ? "__MACA_E4M3" : "__MACA_E5M2";
+
+    // Use __tl_cvt_fp8x2_to_float2 for vectorized conversion (fp8x2 -> float2)
+    if (lanes == 2 || lanes == 4 || lanes == 8) {
+      PrintVectorizedCast("__tl_cvt_fp8x2_to_float2", "__maca_fp8x2_storage_t",
+                          "float2", ", " + type_suffix, true, false);
+      return;
+    }
+  }
+
+  // Handle conversion from float8 (E8M0) to bfloat16
+  if (from_ty.is_float8_e8m0fnu() && target_ty.is_bfloat16()) {
+    // Use __tl_cvt_e8m0x2_to_bfloat162 for vectorized conversion (fp8_e8m0x2 ->
+    // bfloat162)
+    if (lanes == 2 || lanes == 4 || lanes == 8) {
+      PrintVectorizedCast("__tl_cvt_e8m0x2_to_bfloat162",
+                          "__maca_fp8x2_storage_t", "__maca_bfloat162", "", true,
+                          false);
+      return;
+    }
+  }
+
+  // Handle conversion from bfloat16 to float8 (E8M0)
+  if (from_ty.is_bfloat16() && target_ty.is_float8_e8m0fnu()) {
+    // Use __tl_cvt_bfloat162_to_e8m0x2 for vectorized conversion (bfloat162 ->
+    // fp8_e8m0x2)
+    if (lanes == 2 || lanes == 4 || lanes == 8) {
+      PrintVectorizedCast("__tl_cvt_bfloat162_to_e8m0x2", "__maca_bfloat162",
+                          "__maca_fp8x2_storage_t", "", false, true);
+      return;
+    }
+  }
+
+  // Handle conversion from float32 to float8 (E8M0)
+  if (from_ty.is_float() && from_ty.bits() == 32 &&
+      target_ty.is_float8_e8m0fnu()) {
+    // Use __tl_cvt_float2_to_e8m0x2 for vectorized conversion (float2 ->
+    // fp8_e8m0x2)
+    if (lanes == 2 || lanes == 4 || lanes == 8) {
+      PrintVectorizedCast("__tl_cvt_float2_to_e8m0x2", "float2",
+                          "__maca_fp8x2_storage_t", "", false, true);
+      return;
+    }
+  }
+
+  // Handle conversion from double to float8 (E8M0)
+  if (from_ty.is_float() && from_ty.bits() == 64 &&
+      target_ty.is_float8_e8m0fnu()) {
+    // Use __tl_cvt_double2_to_e8m0x2 for vectorized conversion (double2 ->
+    // fp8_e8m0x2)
+    if (lanes == 2 || lanes == 4 || lanes == 8) {
+      PrintVectorizedCast("__tl_cvt_double2_to_e8m0x2", "double2",
+                          "__maca_fp8x2_storage_t", "", false, true);
+      return;
+    }
+  }
+
+  // Handle conversion from float16 to float4 (E2M1)
+  if (from_ty.is_float16() && target_ty.is_float4_e2m1fn()) {
+    // Use __tl_cvt_half2_to_fp4x2 for vectorized conversion (half2 -> fp4x2)
+    if (lanes == 2 || lanes == 4 || lanes == 8) {
+      PrintVectorizedCast("__tl_cvt_half2_to_fp4x2", "half2", "uint8_t", "",
+                          false, true);
+      return;
+    }
+  }
+
+  // Handle conversion from float32 to float4 (E2M1)
+  if (from_ty.is_float() && from_ty.bits() == 32 &&
+      target_ty.is_float4_e2m1fn()) {
+    // Use __tl_cvt_float2_to_fp4x2 for vectorized conversion (float2 -> fp4x2)
+    if (lanes == 2 || lanes == 4 || lanes == 8) {
+      PrintVectorizedCast("__tl_cvt_float2_to_fp4x2", "float2", "uint8_t", "",
+                          false, true);
+      return;
+    }
+  }
+
+  // Handle conversion from float4 (E2M1) to float16
+  if (from_ty.is_float4_e2m1fn() && target_ty.is_float16()) {
+    // Use __tl_cvt_fp4x2_to_half2 for vectorized conversion (fp4x2 -> half2)
+    if (lanes == 2 || lanes == 4 || lanes == 8) {
+      PrintVectorizedCast("__tl_cvt_fp4x2_to_half2", "uint8_t", "half2", "",
+                          true, false);
+      return;
+    }
+  }
+
+  // Handle conversion from float4 (E2M1) to float32
+  if (from_ty.is_float4_e2m1fn() && target_ty.is_float() &&
+      target_ty.bits() == 32) {
+    // Use __tl_cvt_fp4x2_to_float2 for vectorized conversion (fp4x2 -> float2)
+    if (lanes == 2 || lanes == 4 || lanes == 8) {
+      PrintVectorizedCast("__tl_cvt_fp4x2_to_float2", "uint8_t", "float2", "",
+                          true, false);
+      return;
+    }
+  }
+
+  // Handle conversion from double to float4 (E2M1)
+  if (from_ty.is_float() && from_ty.bits() == 64 &&
+      target_ty.is_float4_e2m1fn()) {
+    // Use __tl_cvt_double2_to_fp4x2 for vectorized conversion (double2 ->
+    // fp4x2)
+    if (lanes == 2 || lanes == 4 || lanes == 8) {
+      PrintVectorizedCast("__tl_cvt_double2_to_fp4x2", "double2", "uint8_t", "",
+                          false, true);
+      return;
+    }
+  }
+
+  // Handle conversion from float4 (E2M1) to double
+  if (from_ty.is_float4_e2m1fn() && target_ty.is_float() &&
+      target_ty.bits() == 64) {
+    // Use __tl_cvt_fp4x2_to_double2 for vectorized conversion (fp4x2 ->
+    // double2)
+    if (lanes == 2 || lanes == 4 || lanes == 8) {
+      PrintVectorizedCast("__tl_cvt_fp4x2_to_double2", "uint8_t", "double2", "",
+                          true, false);
+      return;
+    }
+  }
+
+  // Handle conversion from bfloat16 to float4 (E2M1)
+  if (from_ty.is_bfloat16() && target_ty.is_float4_e2m1fn()) {
+    // Use __tl_cvt_bfloat162_to_fp4x2 for vectorized conversion (bfloat162 ->
+    // fp4x2)
+    if (lanes == 2 || lanes == 4 || lanes == 8) {
+      PrintVectorizedCast("__tl_cvt_bfloat162_to_fp4x2", "__maca_bfloat162",
+                          "uint8_t", "", false, true);
+      return;
+    }
+  }
+
+  // Handle conversion from float4 (E2M1) to bfloat16
+  if (from_ty.is_float4_e2m1fn() && target_ty.is_bfloat16()) {
+    // Use __tl_cvt_fp4x2_to_bfloat162 for vectorized conversion (fp4x2 ->
+    // bfloat162)
+    if (lanes == 2 || lanes == 4 || lanes == 8) {
+      PrintVectorizedCast("__tl_cvt_fp4x2_to_bfloat162", "uint8_t",
+                          "__maca_bfloat162", "", true, false);
+      return;
+    }
+  }
+
+  // Fallback: elementwise cast
+  for (int i = 0, lanes = from_ty.lanes(); i < lanes; ++i) {
+    std::ostringstream val;
+    val << "(";
+    PrintType(target_ty.element_of(), val);
+    val << ")(";
+    PrintVecElemLoad(src, from_ty, i, val);
+    val << ")";
+    PrintVecElemStore(sret, target_ty, i, val.str());
+  }
+
   os << sret;
 }
 
+void CodeGenTileLangMACA::VisitExpr_(const MinNode *op, std::ostream &os) {
+  // TODO(wt): Consider vectorized reduction and impl for other dtypes
+  DataType t = op->dtype;
+
+  // Standard min/max functions don't support bfloat16 or float16
+  if ((t.is_bfloat16() || t.is_float16()) && t.is_scalar()) {
+    os << "mctlass::fast_min(" << PrintExpr(op->a) << ", " << PrintExpr(op->b)
+       << ")";
+    return;
+  }
+
+  // For float32 and float64 scalar, use standard min functions
+  if (t.is_float() && t.is_scalar()) {
+    if (t.bits() == 32 || t.bits() == 64) {
+      os << "min(" << PrintExpr(op->a) << ", " << PrintExpr(op->b) << ")";
+      return;
+    }
+  }
+
+  // For all other scalar types (int, uint), use default implementation
+  CodeGenC::VisitExpr_(op, os);
+}
+
+void CodeGenTileLangMACA::VisitExpr_(const MaxNode *op, std::ostream &os) {
+  // TODO(wt): Consider vectorized reduction and impl for other dtypes
+  DataType t = op->dtype;
+
+  // Standard min/max functions don't support bfloat16 or float16
+  if ((t.is_bfloat16() || t.is_float16()) && t.is_scalar()) {
+    os << "mctlass::fast_max(" << PrintExpr(op->a) << ", " << PrintExpr(op->b)
+       << ")";
+    return;
+  }
+
+  // For float32 and float64 scalar, use standard max functions
+  if (t.is_float() && t.is_scalar()) {
+    if (t.bits() == 32 || t.bits() == 64) {
+      os << "max(" << PrintExpr(op->a) << ", " << PrintExpr(op->b) << ")";
+      return;
+    }
+  }
+
+  // For all other scalar types (int, uint), use default implementation
+  CodeGenC::VisitExpr_(op, os);
+}
+
 void CodeGenTileLangMACA::PrintCallExtern(Type ret_type, String global_symbol,
-                                         const Array<PrimExpr> &args,
-                                         bool skip_first_arg,
-                                         std::ostream &os) { // NOLINT(*)
+                                          const Array<PrimExpr> &args,
+                                          bool skip_first_arg,
+                                          std::ostream &os) { // NOLINT(*)
   DataType ret_dtype = GetRuntimeDataType(ret_type);
   if (ret_dtype.is_vector()) {
     //
@@ -722,8 +1240,8 @@ void CodeGenTileLangMACA::PrintCallExtern(Type ret_type, String global_symbol,
 
 // Print a reference expression to a buffer.
 std::string CodeGenTileLangMACA::GetBufferRef(DataType t,
-                                             const BufferNode *buffer,
-                                             PrimExpr index) {
+                                              const BufferNode *buffer,
+                                              PrimExpr index) {
   const VarNode *buffer_var = buffer->data.get();
   std::ostringstream os;
   std::string vid = GetVarID(buffer_var);
@@ -732,7 +1250,7 @@ std::string CodeGenTileLangMACA::GetBufferRef(DataType t,
     scope = alloc_storage_scope_.at(buffer_var);
   }
   // bool is_vol = IsVolatile(buffer_var);
-  // always false for tl cutlass backend.
+  // always false for tl mctlass backend.
   bool is_vol = false;
 
   auto ptr_cast = [this, is_vol, scope](DataType pointed_to) {
@@ -757,58 +1275,182 @@ std::string CodeGenTileLangMACA::GetBufferRef(DataType t,
     temp << "(" << ptr_cast(buffer_element_dtype) << vid << ")";
     buffer_str = temp.str();
   }
-
+  if (scope.empty()) {
+    scope = GetPtrStorageScope(buffer->data);
+  }
+  if (scope == "local.var" || scope.find("local.descriptor") == 0) {
+    os << vid;
+    return os.str();
+  }
   std::string index_str = PrintExpr(index);
   if (t.bits() == 4 || (t.bits() == 1 && t.is_int())) {
-    // This is a special case, because CodegenCUDA::PrintType()
+    // This is a special case, because CodegenMACA::PrintType()
     // returns "int" for bool and for 4-bit integers. In most cases,
     // we divide by the number of lanes to determine the index.
     // However, the backing type for scalar int4 and scalar bool is
     // int32.  Therefore, we need to divide by the ratio of their
     // sizes in that case.
     int div_factor = (t.lanes() == 1) ? (32 / t.bits()) : t.lanes();
-
-    os << "*("
-       << "(" << ptr_cast(t) << vid << ")"
-       << " + " << index_str << " / " << div_factor << ")";
+    index_str =
+        PrintExpr(arith::Analyzer().Simplify(truncdiv(index, div_factor)));
+    os << "*((" << ptr_cast(t) << vid << ")" << " + " << index_str << ")";
   } else if (t == buffer_element_dtype) {
     os << buffer_str << "[" << index_str << "]";
   } else {
+    // Fix fp4 pointer arithmetic: fp4 elements are 4-bit packed 2 per byte.
+    // fp4* + n incorrectly advances n bytes (skipping 2n elements).
+    int div_factor = 1;
+    if (buffer_element_dtype.is_float4() && buffer_element_dtype.lanes() == 1) {
+      div_factor = 2;
+    }
+    index_str =
+        PrintExpr(arith::Analyzer().Simplify(truncdiv(index, div_factor)));
     os << "*" << ptr_cast(t) << "(" << buffer_str << " + " << index_str << ")";
   }
 
   return os.str();
 }
 
+std::string CodeGenTileLangMACA::GetVecLoad(DataType t,
+                                            const BufferNode *buffer,
+                                            PrimExpr base) {
+  const VarNode *buffer_var = buffer->data.get();
+  std::string scope;
+  if (alloc_storage_scope_.count(buffer_var)) {
+    scope = alloc_storage_scope_.at(buffer_var);
+  }
+  if (scope.empty()) {
+    scope = GetPtrStorageScope(buffer->data);
+  }
+
+  if (scope != "global" || t.bits() * t.lanes() <= 128) {
+    return this->CodeGenC::GetVecLoad(t, buffer, base);
+  }
+  ICHECK_EQ(t.bits() * t.lanes(), 256)
+      << "Unsupported vector load size: " << t.bits() * t.lanes();
+  auto buffer_ref = this->GetBufferRef(t, buffer, base);
+  std::ostringstream os;
+  os << "tl::ld_global_256(&(" << buffer_ref << "))";
+  return os.str();
+}
+
+void CodeGenTileLangMACA::PrintVecStore(const BufferNode *buffer, DataType t,
+                                        PrimExpr base,
+                                        const std::string &value) {
+  const VarNode *buffer_var = buffer->data.get();
+  std::string scope;
+  if (alloc_storage_scope_.count(buffer_var)) {
+    scope = alloc_storage_scope_.at(buffer_var);
+  }
+  if (scope.empty()) {
+    scope = GetPtrStorageScope(buffer->data);
+  }
+
+  if (scope != "global" || t.bits() * t.lanes() <= 128) {
+    this->CodeGenC::PrintVecStore(buffer, t, base, value);
+    return;
+  }
+  ICHECK_EQ(t.bits() * t.lanes(), 256)
+      << "Unsupported vector load size: " << t.bits() * t.lanes();
+  auto buffer_ref = this->GetBufferRef(t, buffer, base);
+  this->PrintIndent();
+  this->stream << "tl::st_global_256(&(" << buffer_ref << "), " << value
+               << ");\n";
+}
+
+/**
+ * @brief Emit MACA/Lib-specific code for a call expression.
+ *
+ * This visitor handles CallNode intrinsics and builtins that require emitting
+ * MACA/TL-specific code (inline ASM sequences, TensorLanguage runtime
+ * calls, WMMA/TMA helpers, barriers, cp.async primitives, index-map based
+ * stores, reinterpret/packing helpers, and various mma/ldmatrix patterns). The
+ * function writes the generated code to the provided output stream and falls
+ * back to the C codegen for unrecognized calls.
+ *
+ * The method recognizes and emits code for (non-exhaustive): cp.async and its
+ * commit/wait variants, tma_load/store and im2col variants,
+ * ldmatrix/stmatrix helpers, mbarrier APIs, cooperative grid sync, WMMA/legacy
+ * MMA intrinsics (fill/load/store/mma/bmma), low-level
+ * asm helpers (ldg32, cp_async bulk/init/arrive/wait barriers), reinterpret
+ * paths for special small-float encodings (e.g., float4 e2m1fn), tl::tl_gemm
+ * and related external calls, and other TL runtime calls.
+ *
+ * Side effects:
+ * - Emits to `os` and the internal codegen output stream.
+ * - May set internal feature flags (e.g., need_cooperative_groups_,
+ * need_mma_h_, need_cast_smem_ptr_to_int_, enable_sparse_gemm_).
+ * - May open/close SSA scopes and mutate internal variable mappings.
+ * - May call LOG(FATAL) / CHECK / ICHECK on invalid or unsupported argument
+ *   patterns.
+ *
+ * @param op The call node to generate code for; the function inspects op->op
+ *           and op->args to determine the appropriate emission.
+ * @param os  Output stream to receive expression-level output when the caller
+ *            expects an expression result (some paths write directly to the
+ *            member stream instead).
+ */
 void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
-  auto print_extern_call_stmt = [&](std::string name, size_t offset = 0) {
+  auto print_extern_call_stmt = [&](std::string name, size_t start = 0,
+                                    size_t end = 0) {
+    // Cache context into a private ss, otherwise the let node may generate
+    // within the function call arguments.
+    std::ostringstream ss;
+
+    for (size_t i = start; i < op->args.size() - end; i++) {
+      if (i > start)
+        ss << ", ";
+      ss << this->PrintExpr(op->args[i]);
+    }
+
     this->PrintIndent();
     this->stream << name << "(";
-    for (size_t i = offset; i < op->args.size(); i++) {
-      if (i > offset)
-        this->stream << ", ";
-      this->stream << this->PrintExpr(op->args[i]);
-    }
+    this->stream << ss.str();
     this->stream << ");\n";
   };
   if (op->op.same_as(builtin::ptx_cp_async())) {
+    // args[0] = dst_access_ptr, args[1] = src_access_ptr, args[2] = bytes,
+    // args[3] = predicate (optional)
+    ICHECK(op->args.size() == 3 || op->args.size() == 4)
+        << "ptx_cp_async expects 3 or 4 arguments (dst_access_ptr, "
+           "src_access_ptr, bytes, [predicate])";
+
     std::string dst = this->PrintExpr(op->args[0]);
-    std::string dst_offset = this->PrintExpr(op->args[1]);
-    std::string src = this->PrintExpr(op->args[2]);
-    std::string src_offset = this->PrintExpr(op->args[3]);
-    std::string size = this->PrintExpr(op->args[4]);
-    // use size of argument list to indicate whether or not to use predicated
-    // cp.async
-    if (op->args.size() == 5) {
-      this->PrintIndent();
-      this->stream << "tl::cp_async_gs<" << size << ">(" << dst << "+"
-                   << dst_offset << ", " << src << "+" << src_offset << ");\n";
+    std::string src = this->PrintExpr(op->args[1]);
+    std::string size = this->PrintExpr(op->args[2]);
+
+    this->PrintIndent();
+    if (op->args.size() == 3) {
+      // Non-predicated version
+      this->stream << "tl::cp_async_gs<" << size << ">(" << dst << ", " << src
+                   << ");\n";
     } else {
-      std::string condition = this->PrintExpr(op->args[5]);
-      this->PrintIndent();
+      // Predicated version
+      std::string condition = this->PrintExpr(op->args[3]);
       this->stream << "tl::cp_async_gs_conditional<" << size << ">(" << dst
-                   << "+" << dst_offset << ", " << src << "+" << src_offset
-                   << ", " << condition << ");\n";
+                   << ", " << src << ", " << condition << ");\n";
+    }
+  } else if (op->op.same_as(tl::ptx_cp_async())) {
+    // TileLang version: args[0] = dst_access_ptr, args[1] = src_access_ptr,
+    // args[2] = bytes, args[3] = predicate (optional)
+    ICHECK(op->args.size() == 3 || op->args.size() == 4)
+        << "tl::ptx_cp_async expects 3 or 4 arguments (dst_access_ptr, "
+           "src_access_ptr, bytes, [predicate])";
+
+    std::string dst = this->PrintExpr(op->args[0]);
+    std::string src = this->PrintExpr(op->args[1]);
+    std::string size = this->PrintExpr(op->args[2]);
+
+    this->PrintIndent();
+    if (op->args.size() == 3) {
+      // Non-predicated version
+      this->stream << "tl::cp_async_gs<" << size << ">(" << dst << ", " << src
+                   << ");\n";
+    } else {
+      // Predicated version
+      std::string condition = this->PrintExpr(op->args[3]);
+      this->stream << "tl::cp_async_gs_conditional<" << size << ">(" << dst
+                   << ", " << src << ", " << condition << ");\n";
     }
   } else if (op->op.same_as(builtin::ptx_commit_group())) {
     print_extern_call_stmt("tl::cp_async_commit");
@@ -819,27 +1461,142 @@ void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(builtin::create_barriers())) {
     this->PrintIndent();
     int barrier_count = Downcast<IntImm>(op->args[0])->value;
-    std::string barrier_name = "_mbarrier";
-    this->stream << "__shared__ uint64_t " << barrier_name << "["
+    auto mbarrier_storage_name = mbarrier_name_ + "_mem";
+    this->stream << "__shared__ __align__(" << barrier_alignment_bytes_
+                 << ") uint64_t " << mbarrier_storage_name << "["
                  << barrier_count << "];\n";
+    this->PrintIndent();
+    this->stream << "auto " << mbarrier_name_ << " = reinterpret_cast<"
+                 << mbarrier_dtype_ << "*>(" << mbarrier_storage_name << ");\n";
   } else if (op->op.same_as(tl::get_mbarrier())) {
-    std::string barrier_name = "_mbarrier";
+    // get the mbarrier injected by compiler via barrier_id
+    ICHECK_EQ(op->args.size(), 1);
     std::string barrier_id = this->PrintExpr(op->args[0]);
-    os << barrier_name + "[" + barrier_id + "]";
+    os << mbarrier_name_ + "[" + barrier_id + "]";
   } else if (op->op.same_as(builtin::ptx_arrive_barrier())) {
-    print_extern_call_stmt("tl::mbarrier_arrive");
+    if (op->args.size() == 1) {
+      this->PrintIndent();
+      auto mbarrier_obj = this->PrintExpr(op->args[0]);
+      this->stream << mbarrier_obj << ".arrive();\n";
+    } else if (op->args.size() == 3) {
+      this->PrintIndent();
+      auto mbarrier_obj = this->PrintExpr(op->args[0]);
+      auto cta_id = this->PrintExpr(op->args[1]);
+      auto pred = this->PrintExpr(op->args[2]);
+      this->stream << mbarrier_obj << ".arrive(" << cta_id << ", " << pred
+                   << ");\n";
+    } else {
+      LOG(FATAL) << "Invalid parameter  for tl::arrive_barrier "
+                 << op->args.size();
+    }
   } else if (op->op.same_as(builtin::ptx_init_barrier_thread_count())) {
-    print_extern_call_stmt("tl::mbarrier_init");
+    ICHECK_EQ(op->args.size(), 2);
+    this->PrintIndent();
+    auto mbarrier_obj = this->PrintExpr(op->args[0]);
+    auto arrive_count = this->PrintExpr(op->args[1]);
+    this->stream << mbarrier_obj << ".init(" << arrive_count << ");\n";
   } else if (op->op.same_as(builtin::ptx_arrive_barrier_expect_tx())) {
-    print_extern_call_stmt("tl::mbarrier_arrive_expect_tx");
+    if (op->args.size() == 2) {
+      this->PrintIndent();
+      auto mbarrier_obj = this->PrintExpr(op->args[0]);
+      auto transaction_bytes = this->PrintExpr(op->args[1]);
+      this->stream << mbarrier_obj << ".arrive_and_expect_tx("
+                   << transaction_bytes << ");\n";
+    } else if (op->args.size() == 4) {
+      this->PrintIndent();
+      auto mbarrier_obj = this->PrintExpr(op->args[0]);
+      auto transaction_bytes = this->PrintExpr(op->args[1]);
+      auto cta_id = this->PrintExpr(op->args[2]);
+      auto pred = this->PrintExpr(op->args[3]);
+      this->stream << mbarrier_obj << ".arrive_and_expect_tx("
+                   << transaction_bytes << ", " << cta_id << ", " << pred
+                   << ");\n";
+    } else {
+      LOG(FATAL) << "Invalid parameter  for tl::arrive_barrier_expect_tx "
+                 << op->args.size();
+    }
   } else if (op->op.same_as(builtin::ptx_cp_async_barrier())) {
     print_extern_call_stmt("tl::mbarrier_cp_async_arrive");
+  } else if (op->op.same_as(tl::ptx_fence_barrier_init())) {
+    print_extern_call_stmt("tl::fence_barrier_init");
+  } else if (op->op.same_as(tl::ptx_cp_async_barrier_noinc())) {
+    print_extern_call_stmt("tl::mbarrier_cp_async_arrive_noinc");
   } else if (op->op.same_as(tl::mbarrier_expect_tx())) {
-    print_extern_call_stmt("tl::mbarrier_expect_tx");
+    ICHECK_EQ(op->args.size(), 2);
+    this->PrintIndent();
+    auto mbarrier_obj = this->PrintExpr(op->args[0]);
+    auto transaction_bytes = this->PrintExpr(op->args[1]);
+    this->stream << mbarrier_obj << ".expect_transaction(" << transaction_bytes
+                 << ");\n";
   } else if (op->op.same_as(tl::mbarrier_wait_parity())) {
-    print_extern_call_stmt("tl::mbarrier_wait");
-  } else if (op->op.same_as(tl::sync_thread_partial())) {
-    print_extern_call_stmt("tl::syncthreads_partial");
+    ICHECK_EQ(op->args.size(), 2);
+    this->PrintIndent();
+    auto mbarrier_obj = this->PrintExpr(op->args[0]);
+    auto phase = this->PrintExpr(op->args[1]);
+    this->stream << mbarrier_obj << ".wait(" << phase << ");\n";
+  } else if (op->op.same_as(tl::ptx_init_tensor_memory())) {
+    print_extern_call_stmt("tl::tmem_allocate");
+  } else if (op->op.same_as(tl::ptx_deallocate_tensor_memory())) {
+    print_extern_call_stmt("tl::tmem_deallocate");
+  } else if (op->op.same_as(tl::no_set_max_nreg())) {
+    return;
+  } else if (op->op.same_as(tl::tma_load())) {
+    std::ostringstream ss;
+    ICHECK_GE(op->args.size(), 2);
+    auto eviction_policy =
+        this->eviction_policy_names_
+            [op->args[op->args.size() - 1].as<IntImmNode>()->value];
+    // Simplify the code by using the default eviction policy
+    if (eviction_policy != "EVICT_NORMAL") {
+      ss << "tl::tma_load<tl::CacheHintSm90::" << eviction_policy << ">(";
+    } else {
+      ss << "tl::tma_load(";
+    }
+    auto desc = op->args[0];
+    ss << this->PrintExpr(desc) << ", ";
+    ss << this->PrintExpr(op->args[1]) << ", ";
+    for (size_t i = 2; i < op->args.size() - 1; i++) {
+      if (i > 2)
+        ss << ", ";
+      ss << this->PrintExpr(op->args[i]);
+    }
+    ss << ");\n";
+    this->PrintIndent();
+    this->stream << ss.str();
+  } else if (op->op.same_as(tl::tma_load_im2col())) {
+    std::stringstream ss;
+    auto eviction_policy =
+        this->eviction_policy_names_
+            [op->args[op->args.size() - 1].as<IntImmNode>()->value];
+    if (eviction_policy != "EVICT_NORMAL") {
+      ss << "tl::tma_load_im2col<tl::CacheHintSm90::" << eviction_policy << ">";
+    } else {
+      ss << "tl::tma_load_im2col";
+    }
+    print_extern_call_stmt(ss.str(), 0, 1);
+  } else if (op->op.same_as(tl::tma_store())) {
+    std::stringstream ss;
+    auto need_reduce = op->args[op->args.size() - 2].as<IntImmNode>()->value;
+    if (need_reduce) {
+      print_extern_call_stmt("tl::tma_store_add", 0, 2);
+      return;
+    }
+    auto eviction_policy =
+        this->eviction_policy_names_
+            [op->args[op->args.size() - 1].as<IntImmNode>()->value];
+    if (eviction_policy != "EVICT_NORMAL") {
+      ss << "tl::tma_store<tl::CacheHintSm90::" << eviction_policy << ">";
+    } else {
+      ss << "tl::tma_store";
+    }
+    print_extern_call_stmt(ss.str(), 0, 2);
+  } else if (op->op.same_as(tl::ptx_ldmatrix())) {
+    int trans = Downcast<IntImm>(op->args[0])->value;
+    int num = Downcast<IntImm>(op->args[1])->value;
+    std::string func_name = "tl::ptx_ldmatrix_x" + std::to_string(num);
+    if (trans == 1)
+      func_name += "_trans";
+    print_extern_call_stmt(func_name, 2);
   } else if (op->op.same_as(tl::ptx_stmatirx())) {
     int trans = Downcast<IntImm>(op->args[0])->value;
     int num = Downcast<IntImm>(op->args[1])->value;
@@ -847,6 +1604,44 @@ void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
     if (trans == 1)
       func_name += "_trans";
     print_extern_call_stmt(func_name, 2);
+  } else if (op->op.same_as(tl::fence_proxy_async())) {
+    print_extern_call_stmt("tl::fence_proxy_async");
+  } else if (op->op.same_as(tl::tma_store_arrive())) {
+    print_extern_call_stmt("tl::tma_store_arrive");
+  } else if (op->op.same_as(tl::tma_store_wait())) {
+    print_extern_call_stmt("tl::tma_store_wait<0>");
+  } else if (op->op.same_as(tl::warpgroup_arrive())) {
+    print_extern_call_stmt("tl::warpgroup_arrive");
+  } else if (op->op.same_as(tl::warpgroup_commit_batch())) {
+    print_extern_call_stmt("tl::warpgroup_commit_batch");
+  } else if (op->op.same_as(tl::warpgroup_wait())) {
+    this->PrintIndent();
+    int num_mma = Downcast<IntImm>(op->args[0])->value;
+    this->stream << "tl::warpgroup_wait<" << std::to_string(num_mma)
+                 << ">();\n";
+  } else if (op->op.same_as(tl::warpgroup_fence_operand())) {
+    ICHECK_EQ(op->args.size(), 4U);
+    std::string dtype = Downcast<StringImm>(op->args[0])->value;
+    std::string data_ptr = this->PrintExpr(op->args[1]);
+    std::string offset = this->PrintExpr(op->args[2]);
+    std::string num_regs = this->PrintExpr(op->args[3]);
+    auto dtype_enum = tl::codegen::ptx::DTypeFromString(dtype);
+    std::string cast_type = "uint32_t";
+    if (dtype_enum == tl::codegen::ptx::DataType::kFloat32 ||
+        dtype_enum == tl::codegen::ptx::DataType::kTensorFloat32) {
+      cast_type = "float";
+    }
+    this->PrintIndent();
+    this->stream << "tl::warpgroup_fence_operand(reinterpret_cast<" << cast_type
+                 << "*>(" << data_ptr << " + " << offset << "), " << num_regs
+                 << ");\n";
+  } else if (op->op.same_as(tl::set_max_nreg())) {
+    this->PrintIndent();
+    int nreg = Downcast<IntImm>(op->args[0])->value;
+    int is_inc = Downcast<IntImm>(op->args[1])->value;
+    std::string func_name =
+        is_inc ? "tl::warpgroup_reg_alloc" : "tl::warpgroup_reg_dealloc";
+    this->stream << func_name << "<" << std::to_string(nreg) << ">();\n";
   } else if (op->op.same_as(tl::wait_wgmma())) {
     this->PrintIndent();
     int num_mma = Downcast<IntImm>(op->args[0])->value;
@@ -854,10 +1649,17 @@ void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(tl::pack_b16())) {
     os << "__pack_half2(" << this->PrintExpr(op->args[0]) << ", "
        << this->PrintExpr(op->args[1]) << ")";
+  } else if (op->op.same_as(tl::sync_grid())) {
+    this->need_cooperative_groups_ = true;
+    this->PrintIndent();
+    this->stream << "cooperative_groups::this_grid().sync();\n";
+  } else if (op->op.same_as(tl::loop_break())) {
+    this->PrintIndent();
+    this->stream << "break;\n";
   } else if (op->op.same_as(builtin::tvm_fill_fragment())) {
     need_mma_h_ = true;
     ICHECK_EQ(op->args.size(), 6U);
-    os << "nvcuda::wmma::fill_fragment(";
+    os << "mxmaca::wmma::fill_fragment(";
     this->PrintExpr(op->args[0], os);
     os << "[";
     this->PrintExpr(op->args[4], os);
@@ -867,7 +1669,7 @@ void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(builtin::tvm_load_matrix_sync())) {
     need_mma_h_ = true;
     ICHECK_EQ(op->args.size(), 8U);
-    os << "nvcuda::wmma::load_matrix_sync(";
+    os << "mxmaca::wmma::load_matrix_sync(";
     this->PrintExpr(op->args[0], os);
     os << "[";
     this->PrintExpr(op->args[4], os);
@@ -879,7 +1681,7 @@ void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(builtin::tvm_store_matrix_sync())) {
     need_mma_h_ = true;
     ICHECK_EQ(op->args.size(), 8U);
-    os << "nvcuda::wmma::store_matrix_sync(";
+    os << "mxmaca::wmma::store_matrix_sync(";
     this->PrintExpr(op->args[5], os);
     os << ", ";
     this->PrintExpr(op->args[0], os);
@@ -888,7 +1690,7 @@ void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
     os << "], ";
     this->PrintExpr(op->args[6], os);
     if (const StringImmNode *str = op->args[7].as<StringImmNode>()) {
-      os << ", nvcuda::wmma::mem_" << str->value;
+      os << ", mxmaca::wmma::mem_" << str->value;
     } else {
       LOG(FATAL) << "Invalid parameters";
     }
@@ -896,7 +1698,7 @@ void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(builtin::tvm_mma_sync())) {
     need_mma_h_ = true;
     ICHECK_EQ(op->args.size(), 8U);
-    os << "nvcuda::wmma::mma_sync(";
+    os << "mxmaca::wmma::mma_sync(";
     for (int i = 0; i < 4; ++i) {
       this->PrintExpr(op->args[i * 2], os);
       os << "[";
@@ -906,15 +1708,15 @@ void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(builtin::tvm_bmma_sync())) {
     need_mma_h_ = true;
     ICHECK_EQ(op->args.size(), 8U);
-    os << "nvcuda::wmma::bmma_sync(";
+    os << "mxmaca::wmma::bmma_sync(";
     for (int i = 0; i < 4; ++i) {
       this->PrintExpr(op->args[i * 2], os);
       os << "[";
       this->PrintExpr(op->args[i * 2 + 1], os);
       os << "]" << ((i < 3) ? ", " : ")");
     }
-  } else if (op->op.same_as(builtin::tvm_mfma())) {
-    // arg 0: prefix: {otype}_16x16x16{itype}
+  } else if (op->op.same_as(tl::tvm_mfma())) {
+    // arg 0: prefix: {otype}_{intrM}x{intrN}x{intrK}_{itype}
     // arg 1: A layout: row/col
     // arg 2: B layout: row/col
     // arg 3: A precision: float16, float32, ...
@@ -948,28 +1750,29 @@ void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
         {"int8", "char"},
         {"int32", "int"},
         {"int8x4", "int32_t"},
+        {"int8x8", "int64_t"},
         {"int32x4", "int32x4"},
         {"float16", "half"},
         {"float32", "float"},
         {"float64", "double"},
         {"float16x4", "float16x4"},
-        {"bfloat16x4", "bfloat16x4"},
+        {"bfloat16x4", "bfloat16x4_vec"},
         {"float32x4", "float32x4"},
         {"float8_e4m3fnuzx4", "fp8_e4_4_t"},
         {"float8_e4m3fnuzx8", "long"},
         {"float32x16", "float32x16"}};
     std::string call_mfma_code = R"({
-    *((({C_dytpe}*){c_ref}) + {c_bias}) = {mfma_buildin}(*((({A_dytpe}*){a_ref}) + {a_bias}),
-                  *((({B_dytpe}*){b_ref}) + {b_bias}),
-                  *((({C_dytpe}*){c_ref}) + {c_bias}), 0, 0, 0);
-  })";
-    std::string mfma_buildin = "__builtin_amdgcn_mfma_" + prefix;
+      *((({C_dtype}*){c_ref}) + {c_bias}) = {mfma_buildin}(*((({A_dtype}*){a_ref}) + {a_bias}),
+                    *((({B_dtype}*){b_ref}) + {b_bias}),
+                    *((({C_dtype}*){c_ref}) + {c_bias}));
+    })";
+    std::string mfma_buildin = "__builtin_mxc_mma_" + prefix;
     Replacer replacer;
 
     replacer.register_rule("{mfma_buildin}", mfma_buildin);
-    replacer.register_rule("{A_dytpe}", dtype_map[A_dtype]);
-    replacer.register_rule("{B_dytpe}", dtype_map[B_dtype]);
-    replacer.register_rule("{C_dytpe}", dtype_map[C_dtype]);
+    replacer.register_rule("{A_dtype}", dtype_map[A_dtype]);
+    replacer.register_rule("{B_dtype}", dtype_map[B_dtype]);
+    replacer.register_rule("{C_dtype}", dtype_map[C_dtype]);
     replacer.register_rule("{a_ref}", a_ref);
     replacer.register_rule("{a_bias}", a_bias);
     replacer.register_rule("{b_ref}", b_ref);
@@ -977,16 +1780,215 @@ void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
     replacer.register_rule("{c_ref}", c_ref);
     replacer.register_rule("{c_bias}", c_bias);
     os << replacer.rewrite(call_mfma_code);
+  } else if (op->op.same_as(builtin::ptx_mma())) {
+    // arg 0: shape: mXnXkX
+    // arg 1: A layout: row/col
+    // arg 2: B layout: row/col
+    // arg 3: A precision: fp16, fp64, ...
+    // arg 4: B precision: fp16, fp64, ...
+    // arg 5: C precision: fp32, fp64, ...
+    // arg 6: A multiplicand
+    // arg 7: A multiplicand index
+    // arg 8: B multiplicand
+    // arg 9: B multiplicand index
+    // arg 10: C accumulator
+    // arg 11: C accumulator index
+    // arg 12: saturate
+    // arg 13: (optional) 1-bit operator (xor or and)
+    ICHECK(op->args.size() == 13U || op->args.size() == 14U);
+    std::string shape = Downcast<StringImm>(op->args[0])->value;
+    std::string A_layout = Downcast<StringImm>(op->args[1])->value;
+    std::string B_layout = Downcast<StringImm>(op->args[2])->value;
+    std::string A_dtype = Downcast<StringImm>(op->args[3])->value;
+    std::string B_dtype = Downcast<StringImm>(op->args[4])->value;
+    std::string C_dtype = Downcast<StringImm>(op->args[5])->value;
+    std::string a_ref = this->PrintExpr(op->args[6]);
+    std::string a_bias = this->PrintExpr(op->args[7]);
+    std::string b_ref = this->PrintExpr(op->args[8]);
+    std::string b_bias = this->PrintExpr(op->args[9]);
+    std::string c_ref = this->PrintExpr(op->args[10]);
+    std::string c_bias = this->PrintExpr(op->args[11]);
+    auto dtype_a_enum = tl::codegen::ptx::DTypeFromString(A_dtype);
+    auto dtype_b_enum = tl::codegen::ptx::DTypeFromString(B_dtype);
+    auto dtype_c_enum = tl::codegen::ptx::DTypeFromString(C_dtype);
+    auto [m, n, k] = tl::codegen::ptx::ParseMMAShape(shape);
+
+    need_mma_instruction_h_ = true;
+    this->PrintIndent();
+    std::string mma_call =
+        "tl::mma_sync<(AType), (BType), (CType), (M), (N), (K), (TransA), "
+        "(TransB)>(reinterpret_cast<(CRegType)*>((C_ptr) + (C_offset)), "
+        "reinterpret_cast<const (ARegType)*>((A_ptr) + (A_offset)), "
+        "reinterpret_cast<const (BRegType)*>((B_ptr) + (B_offset)));\n";
+    tl::codegen::Replacer replacer;
+
+    // TODO(lei): Type Workaround for TF32, should be removed when
+    // we introduced tfloat32_t in the frontend.
+    std::string AType = tl::codegen::ptx::DTypeEnumToString(dtype_a_enum);
+    if (AType == "tl::DataType::kFloat32") {
+      AType = "tl::DataType::kTensorFloat32";
+    }
+    std::string BType = tl::codegen::ptx::DTypeEnumToString(dtype_b_enum);
+    if (BType == "tl::DataType::kFloat32") {
+      BType = "tl::DataType::kTensorFloat32";
+    }
+    std::string ARegType = tl::codegen::GetMMARegisterType(dtype_a_enum);
+    if (ARegType == "float") {
+      ARegType = "uint32_t";
+    }
+    std::string BRegType = tl::codegen::GetMMARegisterType(dtype_b_enum);
+    if (BRegType == "float") {
+      BRegType = "uint32_t";
+    }
+
+    replacer.register_rule("(AType)", AType);
+    replacer.register_rule("(BType)", BType);
+    replacer.register_rule("(CType)",
+                           tl::codegen::ptx::DTypeEnumToString(dtype_c_enum));
+    replacer.register_rule("(M)", std::to_string(m));
+    replacer.register_rule("(N)", std::to_string(n));
+    replacer.register_rule("(K)", std::to_string(k));
+    replacer.register_rule("(TransA)", A_layout == "row" ? "false" : "true");
+    replacer.register_rule("(TransB)", B_layout == "row" ? "false" : "true");
+    replacer.register_rule("(ARegType)", ARegType);
+    replacer.register_rule("(BRegType)", BRegType);
+    replacer.register_rule("(CRegType)",
+                           tl::codegen::GetMMARegisterType(dtype_c_enum));
+    replacer.register_rule("(A_ptr)", a_ref);
+    replacer.register_rule("(A_offset)", a_bias);
+    replacer.register_rule("(B_ptr)", b_ref);
+    replacer.register_rule("(B_offset)", b_bias);
+    replacer.register_rule("(C_ptr)", c_ref);
+    replacer.register_rule("(C_offset)", c_bias);
+    this->stream << replacer.rewrite(mma_call);
+  } else if (op->op.same_as(builtin::ptx_mma_sp())) {
+    // arg 0: shape: mXnXkX
+    // arg 1: A layout: row/col
+    // arg 2: B layout: row/col
+    // arg 3: A precision: fp16, fp32, ...
+    // arg 4: B precision: fp16, fp32, ...
+    // arg 5: C precision: fp16, fp32, ...
+    // arg 6: A multiplicand pointer
+    // arg 7: A multiplicand index
+    // arg 8: B multiplicand pointer
+    // arg 9: B multiplicand index
+    // arg 10: C accumulator pointer
+    // arg 11: C accumulator index
+    // arg 12: metadata
+    // arg 13: metadata index
+    // arg 14: sparse_selector
+    // arg 15: saturate
+    ICHECK_EQ(op->args.size(), 16U);
+    std::string shape = Downcast<StringImm>(op->args[0])->value;
+    std::string A_layout = Downcast<StringImm>(op->args[1])->value;
+    std::string B_layout = Downcast<StringImm>(op->args[2])->value;
+    std::string A_dtype = Downcast<StringImm>(op->args[3])->value;
+    std::string B_dtype = Downcast<StringImm>(op->args[4])->value;
+    std::string C_dtype = Downcast<StringImm>(op->args[5])->value;
+    std::string a_ref = this->PrintExpr(op->args[6]);
+    std::string a_offset = this->PrintExpr(op->args[7]);
+    std::string b_ref = this->PrintExpr(op->args[8]);
+    std::string b_offset = this->PrintExpr(op->args[9]);
+    std::string c_ref = this->PrintExpr(op->args[10]);
+    std::string c_offset = this->PrintExpr(op->args[11]);
+    std::string metadata = this->PrintExpr(op->args[12]);
+    std::string metadata_offset = this->PrintExpr(op->args[13]);
+    std::string sparse_selector = this->PrintExpr(op->args[14]);
+    bool saturate = Downcast<Bool>(op->args[15])->value;
+    this->PrintIndent();
+    std::string asm_code = PrintMMAAssembly(
+        shape, A_layout, B_layout, A_dtype, B_dtype, C_dtype, a_ref, a_offset,
+        b_ref, b_offset, c_ref, c_offset, metadata, metadata_offset,
+        sparse_selector, "", true, saturate);
+    this->stream << asm_code;
+  } else if (op->op.same_as(builtin::ptx_ldmatrix())) {
+    // arg 0: whether the matrix is loaded in column major format or not.
+    // arg 1: number of matrices to load.
+    // arg 2: The data type in the matrix, .b16 is the only accepted data type.
+    // arg 3: pointer to local buffer.
+    // arg 4: The offset of the element to store in the local buffer.
+    // arg 5: pointer to the shared memory buffer to load.
+    // arg 6: The offset of the start element of the row to load in shared
+    // memory.
+    ICHECK_EQ(op->args.size(), 7U);
+    bool trans = Downcast<Bool>(op->args[0])->value;
+    int num = Downcast<Integer>(op->args[1])->value;
+    std::string type = Downcast<StringImm>(op->args[2])->value;
+    std::string local_ptr = this->PrintExpr(op->args[3]);
+    std::string local_elem_offset = this->PrintExpr(op->args[4]);
+    std::string smem_ptr = this->PrintExpr(op->args[5]);
+    if (trans && op->dtype.bits() == 8) {
+      // Since ldmatrix assumes that a matrix element is 16 bit, it cannot
+      // properly transpose an int8 matrix.
+      std::string smem_stride = this->PrintExpr(op->args[6]);
+      ICHECK(num == 4);
+      os << "for (int i = 0; i < 16; ++i) {\n";
+      os << local_ptr << "[" + local_elem_offset + " + i] = " << smem_ptr
+         << "[(i % 8) / 4 * " + smem_stride +
+                " * 16 + (threadIdx.x % 4) * 4 * " + smem_stride +
+                "+ (i % 4) * " + smem_stride +
+                " + threadIdx.x / 4 + (i / 8) * 8];\n";
+      os << "}\n";
+    } else {
+      std::string smem_elem_offset = this->PrintExpr(op->args[6]);
+      std::string func_name = "tl::ptx_ldmatrix_x" + std::to_string(num);
+      if (trans == 1)
+        func_name += "_trans";
+      this->PrintIndent();
+      this->stream << func_name << "(" << smem_ptr << " + " << smem_elem_offset
+                   << ", " << local_ptr << " + " << local_elem_offset << ");\n";
+    }
+  } else if (op->op.same_as(tl::rng_init())) {
+    this->need_mcrand_kernel_h_ = true;
+    this->mcrand_philox_state = name_supply_->FreshName("__philox_state");
+    this->PrintIndent();
+    this->stream << "mcrandStatePhilox4_32_10_t " << this->mcrand_philox_state
+                 << ";\n";
+    this->PrintIndent();
+    this->stream << "mcrand_init(" << PrintExpr(op->args[0]) << ", "
+                 << PrintExpr(op->args[1]) << ", " << PrintExpr(op->args[2])
+                 << ", &" << this->mcrand_philox_state << ");\n";
+    // Store state_var for later use by rng_rand
+  } else if (op->op.same_as(tl::rng_rand())) {
+    this->need_mcrand_kernel_h_ = true;
+    os << "mcrand(&" << this->mcrand_philox_state << ")";
+  } else if (op->op.same_as(tl::warp_reduce_sum())) {
+    os << "tl::warp_reduce_sum(" << PrintExpr(op->args[0]) << ")";
+  } else if (op->op.same_as(tl::warp_reduce_max())) {
+    os << "tl::warp_reduce_max(" << PrintExpr(op->args[0]) << ")";
+  } else if (op->op.same_as(tl::warp_reduce_min())) {
+    os << "tl::warp_reduce_min(" << PrintExpr(op->args[0]) << ")";
+  } else if (op->op.same_as(tl::warp_reduce_bitand())) {
+    os << "tl::warp_reduce_bitand(" << PrintExpr(op->args[0]) << ")";
+  } else if (op->op.same_as(tl::warp_reduce_bitor())) {
+    os << "tl::warp_reduce_bitor(" << PrintExpr(op->args[0]) << ")";
+  } else if (op->op.same_as(tl::tl_gemm_sp())) {
+    ICHECK(op->args.size() == 5)
+        << "tl_gemm_sp expects 5 arguments <op_instance, A_ptr, B_ptr, C_ptr, "
+           "E_ptr>, but got "
+        << op->args.size();
+    auto op_instance = Downcast<StringImm>(op->args[0]);
+    enable_sparse_gemm_ = true;
+    this->PrintCallExtern(GetType(tvm::ffi::GetRef<PrimExpr>(op)),
+                          op_instance->value, op->args, true, os);
   } else {
     CodeGenC::VisitExpr_(op, os);
   }
 }
 
 void CodeGenTileLangMACA::VisitStmt_(const AttrStmtNode *op) {
-  if (op->attr_key == tir::attr::async_commit_queue_scope) {
+  if (op->attr_key == tir::attr::fragment_shape) {
+    const VarNode *buffer = op->node.as<VarNode>();
+    const StringImmNode *shape_str = op->value.as<StringImmNode>();
+    fragment_shapes[buffer] = shape_str->value;
+  } else if (op->attr_key == tir::attr::fragment_layout) {
+    const VarNode *buffer = op->node.as<VarNode>();
+    const StringImmNode *layout_str = op->value.as<StringImmNode>();
+    fragment_layouts[buffer] = layout_str->value;
+  } else if (op->attr_key == tir::attr::async_commit_queue_scope) {
     const IntImmNode *queue_id = op->value.as<IntImmNode>();
     ICHECK(queue_id && queue_id->value == 0)
-        << "For CUDA, the index of an async queue must be 0.";
+        << "For MACA, the index of an async queue must be 0.";
     this->VisitStmt(op->body);
     auto commit_group = Call(DataType::Void(), builtin::ptx_commit_group(), {});
     this->VisitExpr(commit_group, this->stream);
@@ -995,7 +1997,7 @@ void CodeGenTileLangMACA::VisitStmt_(const AttrStmtNode *op) {
     auto wait_attrs = GetAsyncWaitAttributes(op);
     auto queue_id = wait_attrs.first.as<IntImmNode>();
     ICHECK(queue_id && queue_id->value == 0)
-        << "For CUDA, the index of an async queue must be 0.";
+        << "For MACA, the index of an async queue must be 0.";
     auto wait_cnt = wait_attrs.second;
     auto wait_group =
         Call(DataType::Void(), builtin::ptx_wait_group(), {wait_cnt});
@@ -1011,6 +2013,10 @@ void CodeGenTileLangMACA::VisitStmt_(const AttrStmtNode *op) {
     this->stream << "const dim3 blockIdx = " << pattern->value << "();\n";
     this->VisitStmt(op->body);
     return;
+  } else if (op->attr_key == "pragma_unroll_factor") {
+    const IntImmNode *factor = op->value.as<IntImmNode>();
+    ICHECK(factor);
+    unroll_factor[op->node.as<VarNode>()] = Downcast<IntImm>(factor);
   }
   CodeGenC::VisitStmt_(op);
 }
@@ -1018,34 +2024,109 @@ void CodeGenTileLangMACA::VisitStmt_(const AttrStmtNode *op) {
 void CodeGenTileLangMACA::VisitStmt_(const AllocateNode *op) {
   ICHECK(!is_zero(op->condition));
   std::string vid = AllocVarID(op->buffer_var.get());
-
   this->PrintIndent();
   std::string scope = GetPtrStorageScope(op->buffer_var);
-  PrintStorageScope(scope, stream);
-  PrintType(op->dtype, stream);
+  const VarNode *buffer = op->buffer_var.as<VarNode>();
+  if (scope.find("wmma.") == 0) {
+    if (scope == "wmma.matrix_a" || scope == "wmma.matrix_b") {
+      ICHECK(op->dtype == DataType::Float(16) ||
+             op->dtype == DataType::Int(8) || op->dtype == DataType::UInt(8) ||
+             op->dtype == DataType::Int(4) || op->dtype == DataType::UInt(4) ||
+             op->dtype == DataType::Int(1) || op->dtype == DataType::BFloat(16))
+          << "Matrix_a and matrix_b only support half or char or unsigned char "
+          << "or uint4 or int4 or int1 type for now";
+    } else {
+      ICHECK(op->dtype == DataType::Float(16) ||
+             op->dtype == DataType::Float(32) || op->dtype == DataType::Int(32))
+          << "Accumulator only support half, float and int type for now";
+    }
+    PrintWmmaScope(scope, op->dtype, buffer, stream);
+  } else if (scope == "local.descriptor.wgmma") {
+    stream << "tl::GmmaDescriptor " << vid << ";\n";
+  } else if (scope == "local.descriptor.tcgen05_smem") {
+    stream << "tl::Tcgen05SMemDescriptor " << vid << ";\n";
+  } else if (scope == "local.descriptor.tcgen05_instr") {
+    stream << "tl::Tcgen05InstrDescriptor " << vid << ";\n";
+  } else {
+    PrintStorageScope(scope, stream);
+    PrintType(op->dtype, stream);
+  }
 
   if (scope == "shared.dyn") {
     stream << ' ' << vid << "[];\n";
   } else {
     size_t constant_size = op->ConstantAllocationSize();
     ICHECK_GT(constant_size, 0)
-        << "Can only handle constant size stack allocation for now";
-
+        << "Can only handle constant size stack allocation for now, but get "
+        << constant_size << " for " << op->buffer_var->name_hint;
+    if (scope.find("wmma.") == 0) {
+      constant_size = GetWmmaFragmentSize(scope, buffer, constant_size);
+    }
     if ((op->dtype == DataType::Int(4) || op->dtype == DataType::UInt(4) ||
          op->dtype == DataType::Int(1)) &&
         scope == "shared") {
       constant_size = constant_size / (32 / op->dtype.bits());
     }
-    stream << ' ' << vid << '[' << constant_size << "];\n";
+    if (scope == "shared") {
+      stream << ' ' << vid << '[' << constant_size << "];\n";
+    } else if (scope == "shared.barrier") {
+      auto v_id_mem = vid + "_mem";
+      stream << ' ' << v_id_mem << "[" << constant_size << "];\n";
+      PrintIndent();
+      stream << "auto " << vid << " = reinterpret_cast<" << mbarrier_dtype_
+             << "*>(" << v_id_mem << ");\n";
+    } else if (scope == "local") {
+      stream << ' ' << vid << '[' << constant_size << "];\n";
+    } else if (scope == "local.var") {
+      PrimExpr init = tir::make_const(op->dtype, 0);
+      auto init_it = op->annotations.find(tl::attr::kLocalVarInit);
+      if (init_it != op->annotations.end()) {
+        PrimExpr user_init = Downcast<PrimExpr>((*init_it).second);
+        if (!user_init.dtype().is_void() && user_init.dtype() != op->dtype) {
+          user_init = tir::Cast(op->dtype, user_init);
+        }
+        init = user_init;
+      }
+      stream << ' ' << vid << " = " << PrintExpr(init) << ";\n";
+    } else if (scope.find("local.descriptor") != 0) {
+      ICHECK(false) << "Unsupported scope: " << scope;
+    }
   }
 
   RegisterHandleType(op->buffer_var.get(), op->dtype);
   this->PrintStmt(op->body);
 }
 
+void CodeGenTileLangMACA::VisitStmt_(const EvaluateNode *op) {
+  if (is_const_int(op->value))
+    return;
+  const CallNode *call = op->value.as<CallNode>();
+  if (call && call->op.same_as(builtin::tvm_global_barrier_kinit())) {
+    PrintIndent();
+    stream << "__shared__ unsigned " << vid_global_barrier_expect_ << ";\n";
+    PrintIndent();
+    stream << "if (threadIdx.x == 0) {\n";
+    PrintIndent();
+    stream << "  " << vid_global_barrier_expect_ << " = 0;\n";
+    PrintIndent();
+    stream << "}\n";
+  }
+  if (call && (call->op.same_as(tvm::tl::device_assert()))) {
+    std::string cond = PrintExpr(call->args[0]);
+    this->PrintIndent();
+    stream << "device_assert(" << cond << ");\n";
+  } else if (call && call->op.same_as(tvm::tl::device_assert_with_msg())) {
+    std::string cond = PrintExpr(call->args[0]);
+    std::string msg_expr = PrintExpr(call->args[1]);
+    this->PrintIndent();
+    stream << "device_assert_with_msg(" << cond << ", " << msg_expr << ");\n";
+  } else {
+    CodeGenC::VisitStmt_(op);
+  }
+}
+
 void CodeGenTileLangMACA::VisitExpr_(const RampNode *op, std::ostream &os) {
   int lanes = static_cast<int>(Downcast<IntImm>(op->lanes)->value);
-  CHECK_LE(lanes, 4) << "ValueError: Ramp of more than 4 lanes is not allowed.";
   os << "(make_";
   PrintType(op->dtype, os);
   os << "(";
@@ -1058,22 +2139,161 @@ void CodeGenTileLangMACA::VisitExpr_(const RampNode *op, std::ostream &os) {
   os << "))";
 }
 
-void CodeGenTileLangMACA::VisitExpr_(const BroadcastNode *op,
-                                    std::ostream &os) { // NOLINT(*)
-  int lanes = static_cast<int>(Downcast<IntImm>(op->lanes)->value);
-  if ((op->dtype.is_int() || op->dtype.is_uint()) && op->dtype.bits() == 8 &&
-      lanes == 4) {
-    // make_int8x4
-    const int64_t *p = as_const_int(op->value);
-    ICHECK(p);
-    int64_t v = *p & 0xFF;
-    v = (v << 24) | (v << 16) | (v << 8) | v;
-    if (op->dtype.is_uint()) {
-      os << "(uint)" << v;
-    } else {
-      os << "(int)" << v;
+void CodeGenTileLangMACA::VisitExpr_(const BufferLoadNode *op,
+                                     std::ostream &os) { // NOLINT(*)
+  ICHECK_EQ(op->indices.size(), 1)
+      << "Load from non-flat memory not supported.";
+  ICHECK(!op->predicate.defined())
+      << "Predicated buffer load is not supported.";
+
+  DataType value_dtype = op->dtype;
+  PrimExpr index = op->indices[0];
+  Var buffer_var = op->buffer->data;
+  DataType element_dtype = op->buffer->dtype;
+
+  int lanes = op->dtype.lanes();
+  // declare type.
+  if (value_dtype.lanes() == element_dtype.lanes()) {
+    std::string ref = GetBufferRef(op->dtype, op->buffer.get(), index);
+    HandleVolatileLoads(ref, op, os);
+  } else {
+    bool can_vector_load = false;
+    arith::PVar<PrimExpr> base;
+    int ramp_lanes = value_dtype.lanes() / element_dtype.lanes();
+    if (arith::ramp(base, 1, ramp_lanes).Match(index)) {
+      const RampNode *ramp = index.as<RampNode>();
+      ICHECK(ramp);
+      can_vector_load = true;
+      // arith::ModularSet me = arith::Analyzer().modular_set(ramp->base);
+      // The condition: {k * coeff + base} divisible by the alignment for any k
+      // if (me->coeff % op->dtype.lanes() == 0 && me->base % op->dtype.lanes()
+      // == 0) {
+      //   can_vector_load = true;
+      // }
     }
-    return;
+
+    if (can_vector_load) {
+      std::string ref = GetVecLoad(op->dtype, op->buffer.get(), base.Eval());
+      HandleVolatileLoads(ref, op, os);
+    } else {
+      std::ostringstream svalue_expr;
+      std::string sindex = SSAGetID(PrintExpr(index), index.dtype());
+      std::string vid = GetVarID(buffer_var.get());
+      DataType elem_type = op->dtype.element_of();
+      for (int i = 0; i < lanes; ++i) {
+        std::ostringstream value_temp;
+        if (!HandleTypeMatch(buffer_var.get(), elem_type)) {
+          value_temp << "((";
+          if (buffer_var.get()->dtype.is_handle()) {
+            auto it = alloc_storage_scope_.find(buffer_var.get());
+            if (it != alloc_storage_scope_.end()) {
+              PrintStorageScope(it->second, value_temp);
+            }
+          }
+          PrintType(elem_type, value_temp);
+          value_temp << "*)" << vid << ')';
+        } else {
+          value_temp << vid;
+        }
+        value_temp << '[';
+        PrintVecElemLoad(sindex, index.dtype(), i, value_temp);
+        value_temp << ']';
+        PrintVecElemLoadExpr(op->dtype, i, value_temp.str(), svalue_expr);
+      }
+      os << svalue_expr.str();
+    }
+  }
+}
+
+void CodeGenTileLangMACA::VisitStmt_(const BufferStoreNode *op) {
+  ICHECK_EQ(op->indices.size(), 1) << "Store to non-flat memory not supported.";
+  ICHECK(!op->predicate.defined())
+      << "Predicated buffer store is not supported.";
+
+  DataType value_dtype = op->value.dtype();
+  DataType element_dtype = op->buffer->dtype;
+  PrimExpr index_expr = op->indices[0];
+  Var buffer_var = op->buffer->data;
+
+  if (value_dtype.lanes() == element_dtype.lanes()) {
+    std::string value = this->PrintExpr(op->value);
+    std::string ref =
+        this->GetBufferRef(value_dtype, op->buffer.get(), index_expr);
+    this->PrintIndent();
+    stream << ref << " = " << value << ";\n";
+  } else {
+    arith::PVar<PrimExpr> base;
+    int ramp_lanes = value_dtype.lanes() / element_dtype.lanes();
+    if (arith::ramp(base, 1, ramp_lanes).Match(index_expr)) {
+      std::string value = this->PrintExpr(op->value);
+      this->PrintVecStore(op->buffer.get(), value_dtype, base.Eval(), value);
+    } else {
+      // The assignment below introduces side-effect, and the resulting value
+      // cannot be reused across multiple expression, thus a new scope is needed
+      int vec_scope = BeginScope();
+
+      // store elements separately
+      std::string index = SSAGetID(PrintExpr(index_expr), index_expr.dtype());
+      std::string value = SSAGetID(PrintExpr(op->value), op->value.dtype());
+      std::string vid = GetVarID(buffer_var.get());
+      for (int i = 0; i < value_dtype.lanes(); ++i) {
+        this->PrintIndent();
+        DataType elem_type = value_dtype.element_of();
+        if (!HandleTypeMatch(buffer_var.get(), elem_type)) {
+          stream << "((";
+          if (buffer_var.get()->dtype.is_handle()) {
+            auto it = alloc_storage_scope_.find(buffer_var.get());
+            if (it != alloc_storage_scope_.end()) {
+              PrintStorageScope(it->second, stream);
+            }
+          }
+          PrintType(elem_type, stream);
+          stream << "*)" << vid << ')';
+        } else {
+          stream << vid;
+        }
+        stream << '[';
+        PrintVecElemLoad(index, index_expr.dtype(), i, stream);
+        stream << "] = ";
+        PrintVecElemLoad(value, op->value.dtype(), i, stream);
+        stream << ";\n";
+      }
+      EndScope(vec_scope);
+    }
+  }
+}
+
+void CodeGenTileLangMACA::VisitExpr_(const BroadcastNode *op,
+                                     std::ostream &os) { // NOLINT(*)
+  int lanes = static_cast<int>(Downcast<IntImm>(op->lanes)->value);
+  if ((op->dtype.is_int() || op->dtype.is_uint()) && op->dtype.bits() == 8) {
+    if (lanes == 4) {
+      // make_int8x4
+      const int64_t *p = as_const_int(op->value);
+      ICHECK(p);
+      int64_t v = *p & 0xFF;
+      v = (v << 24) | (v << 16) | (v << 8) | v;
+      if (op->dtype.is_uint()) {
+        os << "(uint)" << v;
+      } else {
+        os << "(int)" << v;
+      }
+      return;
+    } else if (lanes == 32) {
+      // make_int8x32
+      const int64_t *p = as_const_int(op->value);
+      ICHECK(p);
+      int64_t v = *p & 0xFF;
+      v = (v << 24) | (v << 16) | (v << 8) | v;
+      if (op->dtype.is_uint()) {
+        os << "make_ulonglong4(" << v << ", " << v << ", " << v << ", " << v
+           << ")";
+      } else {
+        os << "make_longlong4(" << v << ", " << v << ", " << v << ", " << v
+           << ")";
+      }
+      return;
+    }
   }
 
   if (op->dtype.is_float16()) {
@@ -1081,10 +2301,19 @@ void CodeGenTileLangMACA::VisitExpr_(const BroadcastNode *op,
     os << "make_";
     PrintType(op->dtype, os);
     os << '(';
-    for (int i = 0; i < lanes / 2; ++i) {
-      if (i != 0)
-        os << ", ";
-      os << "__pack_half2(" << v << ", " << v << ")";
+    if (lanes <= 8) {
+      for (int i = 0; i < lanes / 2; ++i) {
+        if (i != 0)
+          os << ", ";
+        os << "__pack_half2(" << v << ", " << v << ")";
+      }
+    } else {
+      for (int i = 0; i < lanes / 4; ++i) {
+        if (i != 0)
+          os << ", ";
+        os << "tl::pack_float16x4(" << v << ", " << v << ", " << v << ", " << v
+           << ")";
+      }
     }
     os << ')';
     return;
@@ -1095,10 +2324,19 @@ void CodeGenTileLangMACA::VisitExpr_(const BroadcastNode *op,
     os << "make_";
     PrintType(op->dtype, os);
     os << '(';
-    for (int i = 0; i < lanes / 2; ++i) {
-      if (i != 0)
-        os << ", ";
-      os << "__pack_bfloat162(" << v << ", " << v << ")";
+    if (lanes <= 8) {
+      for (int i = 0; i < lanes / 2; ++i) {
+        if (i != 0)
+          os << ", ";
+        os << "__pack_maca_bfloat162(" << v << ", " << v << ")";
+      }
+    } else {
+      for (int i = 0; i < lanes / 4; ++i) {
+        if (i != 0)
+          os << ", ";
+        os << "tl::pack_bfloat16x4(" << v << ", " << v << ", " << v << ", " << v
+           << ")";
+      }
     }
     os << ')';
     return;
@@ -1177,17 +2415,40 @@ void CodeGenTileLangMACA::VisitExpr_(const BroadcastNode *op,
 
 inline void PrintConst(const FloatImmNode *op, std::ostream &os,
                        CodeGenTileLangMACA *p) { // NOLINT(*)
-  // Type code is kBFloat
-  if (op->dtype.is_bfloat16()) {
-    os << "bfloat16_t";
-    os << '(' << std::scientific << op->value << 'f' << ')';
-    return;
-  } else if (op->dtype.is_float8_e4m3fnuz()) {
-    os << "fp8_e4_t";
-    os << '(' << std::scientific << op->value << 'f' << ')';
+  // Type code is kBFloat/kFloat16
+  // which is indeed MCTLASS supported types currently
+  if (op->dtype.is_bfloat16() || op->dtype.is_float16()) {
+    std::ostringstream temp;
+    if (std::isinf(op->value)) {
+      if (op->value < 0) {
+        temp << "-";
+      }
+      temp << "platform::numeric_limits<";
+      p->PrintType(op->dtype, temp);
+      temp << ">::infinity()";
+    } else if (std::isnan(op->value)) {
+      temp << "platform::numeric_limits<";
+      p->PrintType(op->dtype, temp);
+      temp << ">::quiet_NaN()";
+    } else {
+      p->PrintType(op->dtype, temp);
+      temp << '(' << std::hexfloat << op->value << 'f';
+      temp << "/*" << std::scientific << op->value << "*/";
+      temp << ')';
+    }
+    p->MarkConst(temp.str());
+    os << temp.str();
     return;
   }
-  // Type code is kFloat
+  // Type code is kFloat8_e5m2 or kE4M4Float
+  if (op->dtype.is_float8() || op->dtype.is_float4()) {
+    p->PrintType(op->dtype, os);
+    os << '(' << std::hexfloat << op->value << 'f';
+    os << "/*" << std::scientific << op->value << "*/";
+    os << ')';
+    return;
+  }
+  // Type code is kFloat64/kFloat32 (kFloat16 is handled above)
   switch (op->dtype.bits()) {
   case 64:
   case 32: {
@@ -1200,19 +2461,13 @@ inline void PrintConst(const FloatImmNode *op, std::ostream &os,
     } else if (std::isnan(op->value)) {
       temp << ((op->dtype.bits() == 32) ? "MACART_NAN_F" : "MACART_NAN");
     } else {
-      temp << std::scientific << op->value;
+      temp << std::hexfloat << op->value;
       if (op->dtype.bits() == 32)
         temp << 'f';
+      temp << "/*" << std::scientific << op->value << "*/";
     }
     p->MarkConst(temp.str());
     os << temp.str();
-    break;
-  }
-  case 16: {
-    os << "half_t" << '(';
-    FloatImm const_f32 = FloatImm(DataType::Float(32), op->value);
-    PrintConst(const_f32.get(), os, p);
-    os << ')';
     break;
   }
   default:
@@ -1221,13 +2476,68 @@ inline void PrintConst(const FloatImmNode *op, std::ostream &os,
 }
 
 void CodeGenTileLangMACA::VisitExpr_(const FloatImmNode *op,
-                                    std::ostream &os) { // NOLINT(*)
+                                     std::ostream &os) { // NOLINT(*)
   PrintConst(op, os, this);
 }
 
+void CodeGenTileLangMACA::PrintWmmaScope(const std::string &scope, DataType t,
+                                         const VarNode *variable,
+                                         std::ostream &os) {
+  std::stringstream type;
+  PrintType(t, type);
+  ICHECK(fragment_shapes.count(variable))
+      << "Cannot find shape of the wmma fragment " << variable->name_hint;
+  std::string shape_str = fragment_shapes.at(variable);
+  if ((t.is_int() || t.is_uint()) && t.bits() < 8 && t.lanes() == 1) {
+    type.str(std::string());
+    if (t.is_int()) {
+      if (t.bits() == 4) {
+        type << "mxmaca::wmma::experimental::precision::s4";
+      } else if (t.bits() == 1) {
+        type << "mxmaca::wmma::experimental::precision::b1";
+      } else {
+        LOG(FATAL) << "Unhandled integer type for wmma fragment!";
+      }
+    } else if (t.is_uint()) {
+      if (t.bits() == 4) {
+        type << "mxmaca::wmma::experimental::precision::u4";
+      } else {
+        LOG(FATAL) << "Unhandled integer type for wmma fragment!";
+      }
+    }
+  }
+  if (scope == "wmma.matrix_a") {
+    std::string layout_str = fragment_layouts[variable];
+    ICHECK_NE(layout_str, "") << "Layout must be defined for matrix_a";
+    os << "mxmaca::wmma::fragment<mxmaca::wmma::matrix_a, " << shape_str << ", "
+       << type.str() << ", mxmaca::wmma::" << layout_str << ">";
+  } else if (scope == "wmma.matrix_b") {
+    std::string layout_str = fragment_layouts[variable];
+    ICHECK_NE(layout_str, "") << "Layout must be defined for matrix_b";
+    os << "mxmaca::wmma::fragment<mxmaca::wmma::matrix_b, " << shape_str << ", "
+       << type.str() << ", mxmaca::wmma::" << layout_str << ">";
+  } else if (scope == "wmma.accumulator") {
+    os << "mxmaca::wmma::fragment<mxmaca::wmma::accumulator, " << shape_str
+       << ", " << type.str() << ">";
+  }
+}
+
+int32_t CodeGenTileLangMACA::GetWmmaFragmentSize(const std::string &scope,
+                                                 const VarNode *variable,
+                                                 int32_t size) {
+  ICHECK(fragment_shapes.count(variable))
+      << "Cannot find shape of the wmma fragment " << variable->name_hint;
+  std::string shape_str = fragment_shapes.at(variable);
+  std::pair<int32_t, int32_t> dim = GetWmmaFragmentDimSize(shape_str, scope);
+  if (dim.first * dim.second != 0)
+    return size / dim.first / dim.second;
+  else
+    return 0;
+}
+
 void CodeGenTileLangMACA::HandleVolatileLoads(const std::string &value,
-                                             const BufferLoadNode *op,
-                                             std::ostream &os) {
+                                              const BufferLoadNode *op,
+                                              std::ostream &os) {
   // Cast away volatile qualifier for fp16 types. That is, only loads and
   // stores are volatile. The loaded objects are not marked as volatile.
   //
@@ -1242,8 +2552,8 @@ void CodeGenTileLangMACA::HandleVolatileLoads(const std::string &value,
 }
 
 void CodeGenTileLangMACA::PrintVecElemLoadExpr(DataType t, int i,
-                                              const std::string &value,
-                                              std::ostream &os) {
+                                               const std::string &value,
+                                               std::ostream &os) {
   ICHECK_GT(t.lanes(), 1);
   if (t.bits() == 8 && (t.is_int() || t.is_uint())) {
     if (!(t.lanes() == 2 || t.lanes() == 3)) {
@@ -1308,20 +2618,124 @@ void CodeGenTileLangMACA::PrintVecElemLoadExpr(DataType t, int i,
   return;
 }
 
-void CodeGenTileLangMACA::AddFunction(const PrimFunc &f) {
+void CodeGenTileLangMACA::PrintFunctionSignature(const String &function_name,
+                                                 const PrimFunc &func,
+                                                 std::ostream &os) {
+  PrintFuncPrefix(os);
+  CodeGenC::PrintType(func->ret_type, os);
+  CodeGenC::PrintExtraAttrs(func, os);
+  bool no_alias = func->HasNonzeroAttr(tir::attr::kNoAlias);
+  // MXCC has issues with __restrict__ on kernel parameters when using PDL
+  // (Programmatic Dependent Launch) synchronization. Suppress the annotation
+  // when kHasGridSync is set.
+  bool has_maca_pdl_sync = func->HasNonzeroAttr(tl::attr::kHasGridSync);
+  std::unordered_set<const VarNode *> non_restrict;
+  if (auto opt =
+          func->GetAttr<ffi::Array<tir::Var>>(tl::attr::kNonRestrictParams)) {
+    for (const tir::Var &v : opt.value())
+      non_restrict.insert(v.get());
+  }
+  // Read-only param indices attribute, if present.
+  std::unordered_set<int> ro_param_indices;
+  if (auto opt =
+          func->GetAttr<ffi::Array<Integer>>("tl.readonly_param_indices")) {
+    for (const auto &idx : opt.value()) {
+      ro_param_indices.insert(static_cast<int>(Downcast<Integer>(idx)->value));
+    }
+  }
+  os << " " << function_name << "(";
+  for (size_t i = 0; i < func->params.size(); ++i) {
+    tir::Var v = func->params[i];
+    std::string vid = AllocVarID(v.get());
+
+    if (i > 0) {
+      os << ", ";
+    }
+
+    if (v.dtype().is_handle()) {
+      // work around for grid constant parameters.
+      if (auto *ptr = v->type_annotation.as<PointerTypeNode>()) {
+        if (ptr->storage_scope == "grid_constant") {
+          os << "__grid_constant__ const ";
+          CodeGenC::PrintType(ptr->element_type, os);
+          os << ' ' << vid;
+          continue;
+        }
+      }
+
+      auto it = alloc_storage_scope_.find(v.get());
+      if (it != alloc_storage_scope_.end()) {
+        PrintStorageScope(it->second, os);
+      }
+      // If marked read-only, emit const qualifier before type.
+      if (ro_param_indices.count(static_cast<int>(i))) {
+        os << "const ";
+      }
+      CodeGenC::PrintType(GetType(v), os);
+      if (auto *ptr = v->type_annotation.as<PointerTypeNode>()) {
+        if (auto *prim = ptr->element_type.as<PrimTypeNode>()) {
+          RegisterHandleType(v.get(), prim->dtype);
+        }
+      }
+
+      if (!has_maca_pdl_sync && no_alias && !non_restrict.count(v.get())) {
+        PrintRestrict(v, os);
+      }
+    } else {
+      CodeGenC::PrintType(GetType(v), os);
+    }
+    os << ' ' << vid;
+  }
+  os << ")";
+
+  // Register handle data type
+  // TODO(tvm-team): consider simply keep type info in the
+  // type annotation(via a normalizing rewriting).
+  for (const auto &param : func->params) {
+    if (auto *ptr = param->type_annotation.as<PointerTypeNode>()) {
+      if (auto *prim = ptr->element_type.as<PrimTypeNode>()) {
+        RegisterHandleType(param.get(), prim->dtype);
+      }
+    }
+  }
+}
+
+void CodeGenTileLangMACA::AddFunction(const GlobalVar &gvar,
+                                      const PrimFunc &f) {
+  // If the function has already been forward-declared, this is a
+  // no-op.
+  CodeGenC::DeclareFunction(gvar, f);
   // clear previous generated state.
   this->InitFuncState(f);
   // reserve keywords
   ReserveKeywordsAsUnique();
 
   auto global_symbol = f->GetAttr<String>(tvm::attr::kGlobalSymbol);
-  ICHECK(global_symbol.defined())
+  ICHECK(global_symbol)
       << "CodeGenC: Expect PrimFunc to have the global_symbol attribute";
   bool no_alias = f->HasNonzeroAttr(tir::attr::kNoAlias);
+  // MXCC has issues with __restrict__ on kernel parameters when using PDL
+  // (Programmatic Dependent Launch) synchronization. Suppress the annotation
+  // when kHasGridSync is set.
+  bool has_maca_pdl_sync = f->HasNonzeroAttr(tl::attr::kHasGridSync);
+  std::unordered_set<const VarNode *> non_restrict;
+  if (auto opt =
+          f->GetAttr<ffi::Array<tir::Var>>(tl::attr::kNonRestrictParams)) {
+    for (const tir::Var &v : opt.value())
+      non_restrict.insert(v.get());
+  }
+  // Read-only param indices attribute, if present.
+  std::unordered_set<int> ro_param_indices;
+  if (auto opt = f->GetAttr<ffi::Array<Integer>>("tl.readonly_param_indices")) {
+    for (const auto &idx : opt.value()) {
+      ro_param_indices.insert(static_cast<int>(Downcast<Integer>(idx)->value));
+    }
+  }
 
   this->PrintFuncPrefix(stream);
   CodeGenC::PrintType(f->ret_type, stream);
-  this->PrintExtraAttrs(f, stream);
+  this->PrintExtraAttrs(f);
+
   this->stream << " " << static_cast<std::string>(global_symbol.value()) << "(";
 
   for (size_t i = 0; i < f->params.size(); ++i) {
@@ -1344,7 +2758,10 @@ void CodeGenTileLangMACA::AddFunction(const PrimFunc &f) {
       if (it != alloc_storage_scope_.end()) {
         PrintStorageScope(it->second, stream);
       }
-
+      // If marked read-only, emit const qualifier before type.
+      if (ro_param_indices.count(static_cast<int>(i))) {
+        stream << "const ";
+      }
       CodeGenC::PrintType(GetType(v), stream);
       if (auto *ptr = v->type_annotation.as<PointerTypeNode>()) {
         if (auto *prim = ptr->element_type.as<PrimTypeNode>()) {
@@ -1352,7 +2769,7 @@ void CodeGenTileLangMACA::AddFunction(const PrimFunc &f) {
         }
       }
 
-      if (no_alias) {
+      if (!has_maca_pdl_sync && no_alias && !non_restrict.count(v.get())) {
         PrintRestrict(v, stream);
       }
     } else {

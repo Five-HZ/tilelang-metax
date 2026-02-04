@@ -1,15 +1,12 @@
 import tvm.script.ir_builder.tir.ir as _ir
 from tvm.script.ir_builder.tir import frame
 from tvm.tir import PrimExpr
-from typing import Any, Dict
+from typing import Any
 import tilelang.language.tir.op as _tir_op
 import functools
 
 
-def serial(start: PrimExpr,
-           stop: PrimExpr = None,
-           *,
-           annotations: Dict[str, Any] = None) -> frame.ForFrame:
+def serial(start: PrimExpr, stop: PrimExpr = None, *, annotations: dict[str, Any] = None) -> frame.ForFrame:
     """The serial For statement.
 
     Parameters
@@ -31,10 +28,7 @@ def serial(start: PrimExpr,
     return _ir.serial(start=start, stop=stop, annotations=annotations)
 
 
-def parallel(start: PrimExpr,
-             stop: PrimExpr = None,
-             *,
-             annotations: Dict[str, Any] = None) -> frame.ForFrame:
+def parallel(start: PrimExpr, stop: PrimExpr = None, *, annotations: dict[str, Any] = None) -> frame.ForFrame:
     """The parallel For statement.
 
     Parameters
@@ -56,10 +50,7 @@ def parallel(start: PrimExpr,
     return _ir.parallel(start=start, stop=stop, annotations=annotations)
 
 
-def vectorized(start: PrimExpr,
-               stop: PrimExpr = None,
-               *,
-               annotations: Dict[str, Any] = None) -> frame.ForFrame:
+def vectorized(start: PrimExpr, stop: PrimExpr = None, *, annotations: dict[str, Any] = None) -> frame.ForFrame:
     """The vectorized For statement.
 
     Parameters
@@ -81,10 +72,7 @@ def vectorized(start: PrimExpr,
     return _ir.vectorized(start=start, stop=stop, annotations=annotations)
 
 
-def unroll(start: PrimExpr,
-           stop: PrimExpr = None,
-           *,
-           annotations: Dict[str, Any] = None) -> frame.ForFrame:
+def unroll(start: PrimExpr, stop: PrimExpr = None, *, annotations: dict[str, Any] = None) -> frame.ForFrame:
     """The unrolled For statement.
 
     Parameters
@@ -103,6 +91,13 @@ def unroll(start: PrimExpr,
     res : frame.ForFrame
         The ForFrame.
     """
+    # Ensure annotations has {"pragma_unroll_explicit": True} by default
+    if annotations is None:
+        annotations = {"pragma_unroll_explicit": False}
+    else:
+        # Add "pragma_unroll_explicit": True if not already present
+        annotations = dict(annotations)
+        annotations.setdefault("pragma_unroll_explicit", False)
     return _ir.unroll(start=start, stop=stop, annotations=annotations)
 
 
@@ -111,7 +106,7 @@ def thread_binding(
     stop: PrimExpr = None,
     thread: str = None,
     *,
-    annotations: Dict[str, Any] = None,
+    annotations: dict[str, Any] = None,
 ) -> frame.ForFrame:
     """The thread-binding For statement.
 
@@ -154,7 +149,6 @@ def grid(*extents: PrimExpr) -> frame.ForFrame:
 
 
 def _dtype_forward(func):
-
     @functools.wraps(func)
     def wrapped(*args, **kwargs):
         if "dtype" in kwargs:
@@ -165,7 +159,6 @@ def _dtype_forward(func):
 
 
 def _op_wrapper(func):
-
     @functools.wraps(func)
     def wrapped(*args, **kwargs):
         if "dtype" in kwargs:
@@ -291,6 +284,10 @@ call_llvm_pure_intrin = _dtype_forward(_tir_op.call_llvm_pure_intrin)
 call_pure_extern = _dtype_forward(_tir_op.call_pure_extern)
 ptx_mma = _dtype_forward(_tir_op.ptx_mma)
 ptx_mma_sp = _dtype_forward(_tir_op.ptx_mma_sp)
+ptx_wgmma_ss = _dtype_forward(_tir_op.ptx_wgmma_ss)
+ptx_wgmma_rs = _dtype_forward(_tir_op.ptx_wgmma_rs)
+ptx_tcgen05_mma_ss = _dtype_forward(_tir_op.ptx_tcgen05_mma_ss)
+ptx_tcgen05_mma_ts = _dtype_forward(_tir_op.ptx_tcgen05_mma_ts)
 ptx_ldmatrix = _dtype_forward(_tir_op.ptx_ldmatrix)
 ptx_cp_async = _dtype_forward(_tir_op.ptx_cp_async)
 ptx_cp_async_bulk = _dtype_forward(_tir_op.ptx_cp_async_bulk)

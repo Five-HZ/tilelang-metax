@@ -1,10 +1,7 @@
-# 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
-
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
-from typing import Dict, Literal, Union
-from tvm.target import Target
-from tilelang.utils.target import AVALIABLE_TARGETS, determine_target
+from typing import Literal
+from tilelang import language as T
 
 decode_i4_to_f16 = """
 template <typename T1, typename T2, bool isSigned = false>
@@ -381,14 +378,14 @@ __device__ void decode_i4b_to_f16_scale_zeros_quantized_offset(T1 *_i4s, T2 *B_l
     T3 const scale_r = *(scale + scale_offset);
     uint const packed_scales_l = __pack_half2(scale_l, scale_l);
     uint const packed_scales_r = __pack_half2(scale_r, scale_r);
-    
+
     const int num_elems_per_storage_dtype = sizeof(T1) * 8 / 4;
 
     T1 const qzeros_l = *qzeros;
     T1 const qzeros_r = *(qzeros + qzeros_offset);
     int16_t const zero_l = (qzeros_l >> (group_offset * 4) & 0xf);
     int16_t const zero_r = (qzeros_r >> (group_offset * 4) & 0xf);
-    
+
     uint median_num_l = ((0xe400 | zero_l) << 16) | (0xe400 | zero_l);
     uint median_num_r = ((0xe400 | zero_r) << 16) | (0xe400 | zero_r);
 
@@ -1092,16 +1089,15 @@ __device__ void decode_i2u_to_i4s(T1 *_i4u, T2 *B_local_decode, const int N = 16
 
 
 def get_lop3_intrin_group(
-    out_dtype: Literal["float16", "int8", "int4"],
-    source_format: Literal["int", "uint"] = "uint",
+    out_dtype: Literal[T.float16, T.int8, T.int4],
+    source_format: Literal[T.int, T.uint] = T.uint,
     source_bit: int = 4,
-    storage_dtype: Literal["int32", "int8"] = "int8",
+    storage_dtype: Literal[T.int32, T.int8] = T.int8,
     with_scaling: bool = False,
     with_zeros: bool = False,
     zeros_mode: Literal["original", "rescale", "quantized"] = "original",
     storage_scope: str = "local",
-    target: Union[str, Target] = "auto",
-) -> Dict[str, str]:
+) -> dict[str, str]:
     """
     This function is used to get the intrinsic group of the LOP3 operation to avoid the overhead of fast decoding.
     LOP3 is a type of logic operation that takes three inputs. The intrinsic group refers to the set of
@@ -1109,10 +1105,10 @@ def get_lop3_intrin_group(
 
     Parameters
     ----------
-    in_dtype : Literal["int8"]
+    in_dtype : Literal[T.int8]
         The data type of the input. It should be "int8".
 
-    out_dtype : Literal["float16", "int8", "int4"]
+    out_dtype : Literal[T.float16, T.int8, T.int4]
         The data type of the output. It can be either "float16" or "int8" or "int4".
 
     storage_nbit : int, optional
@@ -1135,20 +1131,16 @@ def get_lop3_intrin_group(
     Dict[str, str]
         A dictionary mapping the names of the intrinsics to their corresponding implementations.
     """
-    assert out_dtype in [
-        "float16", "int8", "int4"
-    ], (f"Invalid out_dtype: {out_dtype}. Expected 'float16' or 'int8' or 'int4' .")
+    out_dtype, source_format, storage_dtype = T.dtype(out_dtype), T.dtype(source_format), T.dtype(storage_dtype)
+    assert out_dtype in [T.float16, T.int8, T.int4], f"Invalid out_dtype: {out_dtype}. Expected 'float16' or 'int8' or 'int4' ."
 
-    dtype_mapping = {"float16": "f16", "int4": "i4", "int8": "i8", "int32": "i32"}
+    dtype_mapping = {T.float16: "f16", T.int4: "i4", T.int8: "i8", T.int32: "i32"}
     target_dtype = dtype_mapping[out_dtype]
 
-    if source_format not in ["int", "uint"]:
-        raise ValueError(
-            f"Invalid source_format. Expected 'int' or 'uint', but got {source_format}.")
-    if with_zeros and source_format == "int":
+    if source_format not in [T.int, T.uint]:
+        raise ValueError(f"Invalid source_format. Expected 'int' or 'uint', but got {source_format}, {type(source_format)}.")
+    if with_zeros and source_format == T.int:
         raise ValueError(f"Zeros are not supported for signed integers, but got {source_format}")
-
-    source_symbol = "i" if source_format == "int" else "u"
 
     import_c_map = {
         "i4_to_f16": decode_i4_to_f16,
@@ -1184,30 +1176,22 @@ def get_lop3_intrin_group(
     if is_ladder_stage3:
         key += "_offset"
 
-    if out_dtype == "float16":
+    if out_dtype == T.float16:
         d4f = "f16"
-    elif out_dtype == "int8":
+    elif out_dtype == T.int8:
         d4f = "i8s"
-    elif out_dtype == "int4":
+    elif out_dtype == T.int4:
         d4f = "i4s"
     else:
-        raise ValueError("Unsupported target dtype: {}".format(target_dtype))
-    source_symbol = "u" if source_format == "uint" else "s"
-    func_name = "decode_i{}{}_to_{}".format(source_bit, source_symbol, d4f)
+        raise ValueError(f"Unsupported target dtype: {target_dtype}")
+    source_symbol = "u" if source_format == T.uint else "s"
+    func_name = f"decode_i{source_bit}{source_symbol}_to_{d4f}"
     if with_scaling:
         func_name += "_scale"
     if with_zeros:
         func_name += f"_zeros_{zeros_mode}"
     if is_ladder_stage3:
         func_name += "_offset"
-
-    if isinstance(target, str):
-        assert target in AVALIABLE_TARGETS, f"Invalid target: {target}"
-        target = determine_target(target)
-    target = Target(target)
-    if target.kind.name == "maca":
-        from .lop3_maca import import_maca_c_map
-        import_c_map = import_maca_c_map
 
     return {
         "func_name": func_name,

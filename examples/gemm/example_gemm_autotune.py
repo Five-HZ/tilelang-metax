@@ -1,30 +1,59 @@
-# 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
-
 import argparse
-import torch
 import itertools
 import tilelang as tl
 import tilelang.language as T
 from tilelang.autotuner import AutoTuner
 from tilelang.carver.template import MatmulTemplate
-from tilelang.carver.arch import MACA
+from tilelang.carver.arch import CUDA
+from tilelang.carver.arch import CDNA
 from tilelang.carver.roller.rasterization import NoRasterization
+import torch
 
 
 def ref_program(A, B):
+    """
+    Compute the matrix product of A and the transpose of B.
+
+    A and B are expected to be 2-D tensors where A has shape (M, K) and B has shape (N, K). The result is a tensor with shape (M, N) equal to A @ B.T, using the inputs' dtypes.
+    """
     return A @ B.T
 
 
 def get_configs(M, N, K, with_roller=False, topk=20):
+    """
+    Generate a list of kernel tuning configuration dictionaries for a tiled matrix-multiply.
+
+    When with_roller is True this queries the MatmulTemplate roller to produce up to `topk` recommended
+    configurations (device-specific TensorCore-friendly tilings). Each returned dict contains:
+      - block_M, block_N, block_K: tile sizes
+      - num_stages: pipeline staging (0 means no explicit staging)
+      - thread_num: total threads used for the block
+      - enable_rasteration: whether a rasterization/swizzle layout was recommended (note spelling)
+
+    When with_roller is False this returns the Cartesian product of a fixed set of candidate
+    parameters; the returned dicts use the backward-compatible key name "enable_rasteration" for that flag.
+
+    Parameters:
+        M, N, K (int): GEMM dimensions used to generate valid tile sizes.
+        with_roller (bool): If True, use MatmulTemplate's roller to generate device-aware hints;
+            otherwise use a predefined candidate grid.
+        topk (int): Maximum number of roller hints to request when with_roller is True.
+
+    Returns:
+        List[dict]: A list of configuration dictionaries as described above.
+
+    Raises:
+        ValueError: if with_roller is True but the roller returns no hints.
+    """
     if with_roller:
-        arch = MACA("maca")
+        arch = CUDA("cuda") if torch.version.hip is None else CDNA("hip")
         carve_template = MatmulTemplate(
             M=M,
             N=N,
             K=K,
-            in_dtype="float16",
-            out_dtype="float16",
-            accum_dtype="float",
+            in_dtype=T.float16,
+            out_dtype=T.float16,
+            accum_dtype=T.float32,
         ).with_arch(arch)
 
         func = carve_template.equivalent_function()
@@ -61,7 +90,8 @@ def get_configs(M, N, K, with_roller=False, topk=20):
                 num_stages,
                 thread_num,
                 enable_rasterization,
-            ))
+            )
+        )
 
         configs = [
             {
@@ -71,13 +101,13 @@ def get_configs(M, N, K, with_roller=False, topk=20):
                 "num_stages": c[3],
                 "thread_num": c[4],
                 "enable_rasteration": c[5],  # keep param name for backward-compat
-            } for c in _configs
+            }
+            for c in _configs
         ]
     return configs
 
 
 def get_best_config(M, N, K, with_roller=False):
-
     def kernel(
         block_M=None,
         block_N=None,
@@ -86,17 +116,16 @@ def get_best_config(M, N, K, with_roller=False):
         thread_num=None,
         enable_rasteration=None,
     ):
-        dtype = "float16"
-        accum_dtype = "float"
+        dtype = T.bfloat16
+        accum_dtype = T.float32
 
         @T.prim_func
         def main(
-                A: T.Tensor((M, K), dtype),
-                B: T.Tensor((N, K), dtype),
-                C: T.Tensor((M, N), dtype),
+            A: T.Tensor((M, K), dtype),
+            B: T.Tensor((N, K), dtype),
+            C: T.Tensor((M, N), dtype),
         ):
-            with T.Kernel(
-                    T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=thread_num) as (bx, by):
+            with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=thread_num) as (bx, by):
                 A_shared = T.alloc_shared((block_M, block_K), dtype)
                 B_shared = T.alloc_shared((block_N, block_K), dtype)
                 C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
@@ -117,15 +146,18 @@ def get_best_config(M, N, K, with_roller=False):
 
         return main
 
-    autotuner = AutoTuner.from_kernel(
-        kernel=kernel, configs=get_configs(M, N, K, with_roller)).set_compile_args(
+    autotuner = (
+        AutoTuner.from_kernel(kernel=kernel, configs=get_configs(M, N, K, with_roller))
+        .set_compile_args(
             out_idx=[-1],
             target="auto",
-        ).set_profile_args(
+        )
+        .set_profile_args(
             supply_type=tl.TensorSupplyType.Integer,
             ref_prog=ref_program,
             skip_check=False,
         )
+    )
     return autotuner.run(warmup=3, rep=20)
 
 
@@ -138,51 +170,20 @@ def get_heuristic_config() -> dict:
     sm_version = sm_major * 10 + sm_minor
     print(f"CUDA device capability: {sm_version}")
     if sm_version in {80}:
-        return {
-            "block_M": 128,
-            "block_N": 256,
-            "block_K": 32,
-            "num_stages": 2,
-            "thread_num": 128,
-            "enable_rasteration": True
-        }
+        return {"block_M": 128, "block_N": 256, "block_K": 32, "num_stages": 2, "thread_num": 128, "enable_rasteration": True}
     elif sm_version in {90}:
-        return {
-            "block_M": 128,
-            "block_N": 256,
-            "block_K": 64,
-            "num_stages": 3,
-            "thread_num": 256,
-            "enable_rasteration": True
-        }
+        return {"block_M": 128, "block_N": 256, "block_K": 64, "num_stages": 3, "thread_num": 256, "enable_rasteration": True}
     else:
-        return {
-            "block_M": 128,
-            "block_N": 256,
-            "block_K": 32,
-            "num_stages": 0,
-            "thread_num": 128,
-            "enable_rasteration": True
-        }
+        return {"block_M": 128, "block_N": 256, "block_K": 32, "num_stages": 0, "thread_num": 128, "enable_rasteration": True}
 
 
-def matmul(M,
-           N,
-           K,
-           block_M,
-           block_N,
-           block_K,
-           num_stages,
-           thread_num,
-           enable_rasteration,
-           dtype="float16",
-           accum_dtype="float"):
-
+@tl.jit(out_idx=[-1])
+def matmul(M, N, K, block_M, block_N, block_K, num_stages, thread_num, enable_rasteration, dtype=T.float16, accum_dtype=T.float32):
     @T.prim_func
     def gemm_autotune(
-            A: T.Tensor((M, K), dtype),
-            B: T.Tensor((N, K), dtype),
-            C: T.Tensor((M, N), dtype),
+        A: T.Tensor((M, K), dtype),
+        B: T.Tensor((N, K), dtype),
+        C: T.Tensor((M, N), dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=thread_num) as (bx, by):
             A_shared = T.alloc_shared((block_M, block_K), dtype)
@@ -206,12 +207,7 @@ def matmul(M,
     return gemm_autotune
 
 
-def main(m: int = 16384,
-         n: int = 16384,
-         k: int = 16384,
-         use_autotune: bool = False,
-         with_roller: bool = True):
-    M, N, K = m, n, k
+def main(M: int = 4096, N: int = 4096, K: int = 4096, use_autotune: bool = False, with_roller: bool = False):
     use_autotune = True
     if use_autotune:
         result = get_best_config(M, N, K, with_roller)
@@ -219,7 +215,7 @@ def main(m: int = 16384,
         kernel = result.kernel
     else:
         config = get_heuristic_config()
-        kernel = tl.compile(matmul(M, N, K, **config), out_idx=-1)
+        kernel = matmul(M, N, K, **config)
 
     # benchmark
     profiler = kernel.get_profiler(tensor_supply_type=tl.TensorSupplyType.Auto)
@@ -232,20 +228,19 @@ def main(m: int = 16384,
     print(f"Ref TFlops: {2 * M * N * K / ref_latency * 1e-9}")
 
 
+def run_regression_perf(M: int = 4096, N: int = 4096, K: int = 4096):
+    config = get_heuristic_config()
+    kernel = matmul(M, N, K, **config)
+    profiler = kernel.get_profiler(tensor_supply_type=tl.TensorSupplyType.Auto)
+    return profiler.do_bench(backend="cupti")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Autotuned MatMul Benchmark")
-    parser.add_argument("--m", type=int, default=16384, help="Matrix dimension M")
-    parser.add_argument("--n", type=int, default=16384, help="Matrix dimension N")
-    parser.add_argument("--k", type=int, default=16384, help="Matrix dimension K")
-    parser.add_argument(
-        "--use_autotune",
-        action="store_true",
-        default=False,
-        help="Whether to use autotune for matmul configs")
-    parser.add_argument(
-        "--with_roller",
-        action="store_true",
-        default=False,
-        help="Whether to enable BitBLAS roller for search space")
+    parser.add_argument("--m", type=int, default=4096, help="Matrix dimension M")
+    parser.add_argument("--n", type=int, default=4096, help="Matrix dimension N")
+    parser.add_argument("--k", type=int, default=4096, help="Matrix dimension K")
+    parser.add_argument("--use_autotune", action="store_true", default=False, help="Whether to use autotune for matmul configs")
+    parser.add_argument("--with_roller", action="store_true", default=False, help="Whether to enable BitBLAS roller for search space")
     args = parser.parse_args()
     main(args.m, args.n, args.k, args.use_autotune, args.with_roller)

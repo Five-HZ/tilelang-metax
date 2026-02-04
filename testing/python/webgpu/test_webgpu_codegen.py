@@ -4,13 +4,12 @@ import tilelang.testing
 import tilelang.language as T
 
 
-def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float"):
-
+def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float32):
     @T.prim_func
     def main(
-            A: T.Tensor((M, K), dtype),
-            B: T.Tensor((K, N), dtype),
-            C: T.Tensor((M, N), dtype),
+        A: T.Tensor((M, K), dtype),
+        B: T.Tensor((K, N), dtype),
+        C: T.Tensor((M, N), dtype),
     ):
         # Initialize Kernel Context
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
@@ -39,12 +38,13 @@ def assert_gemm_codegen(
     block_M,
     block_N,
     block_K,
-    dtype="float16",
-    accum_dtype="float",
+    dtype=T.float16,
+    accum_dtype=T.float32,
 ):
     func = matmul(M, N, K, block_M, block_N, block_K, dtype=dtype, accum_dtype=accum_dtype)
-
-    artifact = tilelang.lower(func, target="webgpu")
+    # Because the current pass context have been polluted by previous testing.
+    with tvm.transform.PassContext(), tvm.target.Target("webgpu"):
+        artifact = tilelang.lower(func, target="webgpu")
 
     src_code = artifact.kernel_source
 

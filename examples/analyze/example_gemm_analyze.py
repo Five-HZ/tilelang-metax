@@ -1,6 +1,8 @@
 import tilelang.language as T
 from tilelang.tools import Analyzer
 from tilelang.carver.arch import CUDA
+from tilelang.carver.arch import CDNA
+import torch
 
 M = N = K = 1024
 
@@ -13,14 +15,14 @@ def kernel(
     thread_num=None,
     enable_rasteration=None,
 ):
-    dtype = "float16"
-    accum_dtype = "float"
+    dtype = T.float16
+    accum_dtype = T.float32
 
     @T.prim_func
     def matmul(
-            A: T.Tensor((M, K), dtype),
-            B: T.Tensor((N, K), dtype),
-            C: T.Tensor((M, N), dtype),
+        A: T.Tensor((M, K), dtype),
+        B: T.Tensor((N, K), dtype),
+        C: T.Tensor((M, N), dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=thread_num) as (bx, by):
             A_shared = T.alloc_shared((block_M, block_K), dtype)
@@ -47,7 +49,7 @@ def kernel(
 def main():
     my_func = kernel(128, 128, 32, 3, 128, True)
 
-    cuda_device = CUDA("cuda")
+    cuda_device = CUDA("cuda") if torch.version.hip is None else CDNA("hip")
     result = Analyzer.analysis(my_func, cuda_device)
 
     print(f"Analyzed FLOPs: {result.total_flops}")

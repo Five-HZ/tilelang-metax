@@ -1,13 +1,10 @@
 from collections import OrderedDict
-from typing import Dict, List
 
 from tvm import arith
 
 
-class Statement():
-
-    def __init__(self, output: str, dependent_region: dict, var_map: OrderedDict,
-                 range_map: OrderedDict):
+class Statement:
+    def __init__(self, output: str, dependent_region: dict, var_map: OrderedDict, range_map: OrderedDict):
         self.output = output
         self.dependent_region = dependent_region
         self.var_map = var_map
@@ -18,12 +15,11 @@ def _merge_two_bounds(x: arith.ConstIntBound, y: arith.ConstIntBound):
     return arith.ConstIntBound(min(x.min_value, y.min_value), max(x.max_value, y.max_value))
 
 
-class InputShapeInference():
-
-    def __init__(self, deps: List[Statement]):
+class InputShapeInference:
+    def __init__(self, deps: list[Statement]):
         self.deps = deps
 
-    def _infer(self, shape: Dict[str, List[arith.ConstIntBound]], rstep: Dict[str, int]):
+    def _infer(self, shape: dict[str, list[arith.ConstIntBound]], rstep: dict[str, int]):
         shape = shape.copy()
         ana = arith.Analyzer()
         for dep in reversed(self.deps):
@@ -44,7 +40,7 @@ class InputShapeInference():
             shape[name] = [c.max_value - c.min_value + 1 for c in bounds]
         return shape
 
-    def infer(self, shape, rstep: Dict[str, int] = None):
+    def infer(self, shape, rstep: dict[str, int] = None):
         if rstep is None:
             rstep = {}
         if isinstance(shape, (list, tuple)):

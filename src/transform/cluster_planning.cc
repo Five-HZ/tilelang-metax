@@ -1,31 +1,16 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership. The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
-
 /*!
  * \file clasuter_planning.cc
  * \brief Plan the cluster for GPU(sm90+) blocks
  */
 
 #include <tvm/arith/analyzer.h>
+#include <tvm/ffi/function.h>
+#include <tvm/ffi/reflection/registry.h>
 #include <tvm/tir/analysis.h>
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
+
+#include "../support/ffi_aliases.h"
 
 namespace tvm {
 namespace tir {
@@ -83,8 +68,16 @@ public:
     }
 
     if (mem_reuse_max > 0) {
-      cluster_tag =
-          "clusterIdx" + String(cluster_tag.c_str() + strlen("blockIdx"));
+      std::string tag_str =
+          static_cast<std::string>(cluster_tag); // Convert to std::string
+      if (tag_str.rfind("blockIdx", 0) == 0) {
+        // starts with "blockIdx"
+        tag_str = "clusterIdx" + tag_str.substr(strlen("blockIdx"));
+      } else {
+        // Unexpected format — maybe just prefix
+        tag_str = "clusterIdx" + tag_str;
+      }
+      cluster_tag = String(tag_str); // Convert back
       return WithAttr(f, cluster_tag, Integer(cluster_size_));
     } else {
       return f;
@@ -96,14 +89,14 @@ private:
 
   class RegionVisitor : public ExprVisitor {
   public:
-    RegionVisitor(){};
+    RegionVisitor() {};
     void VisitExpr_(const VarNode *var) { seen_.insert(var); }
     std::unordered_set<const VarNode *> seen_;
   };
 
   class BlockIdxVisitor : public StmtVisitor {
   public:
-    BlockIdxVisitor(){};
+    BlockIdxVisitor() {};
     void VisitStmt_(const AttrStmtNode *attr) final {
       if (attr->attr_key == attr::thread_extent) {
         IterVar iv = Downcast<IterVar>(attr->node);
@@ -126,14 +119,16 @@ PrimFunc ClusterPlanning(PrimFunc f) { return ClusterPlanner::Substitute(f); }
 namespace transform {
 
 tvm::transform::Pass ClusterPlanning() {
-  auto pass_func = [=](PrimFunc f, IRModule m, PassContext ctx) {
+  auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
     return ClusterPlanning(std::move(f));
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.ClusterPlanning", {});
 }
 
-TVM_REGISTER_GLOBAL("tl.transform.ClusterPlanning")
-    .set_body_typed(ClusterPlanning);
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = tvm::ffi::reflection;
+  refl::GlobalDef().def("tl.transform.ClusterPlanning", ClusterPlanning);
+}
 } // namespace transform
 
 } // namespace tir

@@ -1,47 +1,10 @@
-"""The language interface for tl programs."""
+"""Some customized operations frequently used in tensor programming, exposed on the TileLang language surface."""
 
+from __future__ import annotations
 import tilelang.language as T
-from tvm.tir import PrimExpr, Buffer
-from typing import List, Union
-
-
-def atomic_add(dst: Buffer, value: PrimExpr) -> PrimExpr:
-    """Perform an atomic addition operation.
-
-    Args:
-        dst (Buffer): Destination buffer where the atomic addition will be performed
-        value (PrimExpr): Value to be atomically added
-
-    Returns:
-        PrimExpr: Handle to the atomic addition operation
-    """
-    return T.call_extern("handle", "AtomicAdd", T.address_of(dst), value)
-
-
-def atomic_addx2(dst: Buffer, value: PrimExpr) -> PrimExpr:
-    """Perform an atomic addition operation with double-width operands.
-
-    Args:
-        dst (Buffer): Destination buffer where the atomic addition will be performed
-        value (PrimExpr): Value to be atomically added (double-width)
-
-    Returns:
-        PrimExpr: Handle to the double-width atomic addition operation
-    """
-    return T.call_extern("handle", "AtomicAddx2", T.address_of(dst), T.address_of(value))
-
-
-def atomic_addx4(dst: Buffer, value: PrimExpr) -> PrimExpr:
-    """Perform an atomic addition operation with double-width operands.
-
-    Args:
-        dst (Buffer): Destination buffer where the atomic addition will be performed
-        value (PrimExpr): Value to be atomically added (double-width)
-
-    Returns:
-        PrimExpr: Handle to the double-width atomic addition operation
-    """
-    return T.call_extern("handle", "AtomicAddx4", T.address_of(dst), T.address_of(value))
+from tvm.tir import PrimExpr, Buffer, op
+from tilelang.utils.language import bits_product, prim_expr_equal
+from .atomic import atomic_max, atomic_min, atomic_add, atomic_addx2, atomic_addx4, atomic_load, atomic_store  # noqa: F401
 
 
 def dp4a(A: Buffer, B: Buffer, C: Buffer) -> PrimExpr:
@@ -60,12 +23,12 @@ def dp4a(A: Buffer, B: Buffer, C: Buffer) -> PrimExpr:
 
 def clamp(dst: PrimExpr, min_val: PrimExpr, max_val: PrimExpr) -> PrimExpr:
     """Clamps the input value dst between [min_val, max_val]
-    
+
     Args:
         dst: Input value to be clamped
         min_val: Minimum value
         max_val: Maximum value
-    
+
     Returns:
         Value clamped to the specified range
     """
@@ -74,9 +37,9 @@ def clamp(dst: PrimExpr, min_val: PrimExpr, max_val: PrimExpr) -> PrimExpr:
     return dst
 
 
-def reshape(src: Buffer, shape: List[PrimExpr]) -> Buffer:
+def reshape(src: Buffer, shape: list[PrimExpr]) -> Buffer:
     """Reshapes the input buffer to the specified shape.
-    
+
     Args:
         src (Buffer): Input buffer to be reshaped
         shape (List[PrimExpr]): New shape for the buffer
@@ -84,24 +47,29 @@ def reshape(src: Buffer, shape: List[PrimExpr]) -> Buffer:
     Returns:
         Buffer: A new buffer view with the specified shape
     """
-    return T.Buffer(shape, src.dtype, src.data)
+    assert prim_expr_equal(bits_product(shape, src.dtype), bits_product(src.shape, src.dtype)), (
+        f"T.reshape/view shape check failed. src {src} src.shape: {src.shape}, src.dtype: {src.dtype}, target shape: {shape}, target dtype: {src.dtype}"
+    )
+    return T.Tensor(shape, src.dtype, src.data)
 
 
-def view(src: Buffer,
-         shape: Union[List[PrimExpr], None] = None,
-         dtype: Union[str, None] = None) -> Buffer:
-    """Views the input buffer with optionally modified shape and dtype.
-    
-    Args:
-        src (Buffer): Input buffer to be viewed
-        shape (Union[List[PrimExpr], None], optional): New shape for the buffer. Defaults to None.
-        dtype (Union[str, None], optional): New dtype for the buffer. Defaults to None.
+def view(src: Buffer, shape: list[PrimExpr] | None = None, dtype: str | None = None) -> Buffer:
+    """Return a Tensor view of the input buffer with an optional new shape and dtype.
 
-    Returns:
-        Buffer: A new buffer view with the specified shape and dtype
+    If `shape` is None the source buffer's shape is used; if `dtype` is None the source buffer's dtype is used. The returned buffer shares the same underlying data as `src` (no copy).
     """
     if shape is None:
         shape = src.shape
     if dtype is None:
         dtype = src.dtype
-    return T.Buffer(shape, dtype, src.data)
+    assert prim_expr_equal(bits_product(shape, dtype), bits_product(src.shape, src.dtype)), "T.reshape/view shape check failed."
+    return T.Tensor(shape, dtype, src.data)
+
+
+def loop_break():
+    """Break out of the current loop.
+
+    Returns:
+        tir.Call: A call to the `tl.loop_break` intrinsic.
+    """
+    return T.call_intrin("handle", op.Op.get("tl.loop_break"))
