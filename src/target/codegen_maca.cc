@@ -221,7 +221,6 @@ std::string CodeGenTileLangMACA::Finish() {
   // TODO: Add implementation for maca target.
   // decl_stream << "#include <tl_templates/maca/copy.h>\n";
   decl_stream << "#include <tl_templates/maca/reduce.h>\n";
-  decl_stream << "#include <tl_templates/maca/ldsm.h>\n";
   decl_stream << "#include <tl_templates/maca/threadblock_swizzle.h>\n";
   // decl_stream << "#include <tl_templates/maca/debug.h>\n";
   // decl_stream << "#ifdef ENABLE_BF16\n";
@@ -1597,7 +1596,7 @@ void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
     if (trans == 1)
       func_name += "_trans";
     print_extern_call_stmt(func_name, 2);
-  } else if (op->op.same_as(tl::ptx_stmatirx())) {
+  } else if (op->op.same_as(tl::ptx_stmatrix())) {
     int trans = Downcast<IntImm>(op->args[0])->value;
     int num = Downcast<IntImm>(op->args[1])->value;
     std::string func_name = "tl::ptx_stmatrix_x" + std::to_string(num);
