@@ -11,7 +11,7 @@ from tvm import tir
 import tvm_ffi
 from tvm.ir import CallingConv
 from tvm.target import Target
-from tilelang.contrib import hipcc, nvcc
+from tilelang.contrib import hipcc, nvcc, mxcc
 from tilelang.env import COMPOSABLE_KERNEL_INCLUDE_DIR, CUTLASS_INCLUDE_DIR, TILELANG_TEMPLATE_PATH
 from tilelang.transform import PassConfigKey
 from tilelang.transform.metal import MarkHostMetalContext
@@ -127,6 +127,52 @@ def tilelang_callback_hip_compile(code, target):
     )
 
     return hsaco
+
+
+@tvm_ffi.register_global_func("tilelang_callback_maca_compile", override=True)
+def tilelang_callback_maca_compile(code, target, pass_config=None):
+    target_arch = mxcc.get_target_arch(mxcc.get_target_compute_version(target))
+
+    arch = [f"--offload-arch={target_arch}"]
+    compile_format = "mcbin"
+
+    # Read pass-config keys (string-valued) like in jit.adapter.libgen.compile_lib
+    cfg = pass_config or {}
+    enable_fast_math = bool(cfg.get(PassConfigKey.TL_ENABLE_FAST_MATH, False))
+
+    options = [
+        "-std=c++17",
+        "-I" + TILELANG_TEMPLATE_PATH,
+    ]
+
+    # Merge extra device compiler flags from pass config, if provided
+    extra_flags = cfg.get(PassConfigKey.TL_DEVICE_COMPILE_FLAGS, None)
+    if extra_flags:
+        import shlex
+
+        if isinstance(extra_flags, str):
+            tokens = shlex.split(extra_flags)
+        else:
+            tokens = []
+            for flag in extra_flags:
+                if isinstance(flag, str):
+                    tokens.extend(shlex.split(flag))
+                else:
+                    tokens.append(str(flag))
+        options += tokens
+
+    if enable_fast_math:
+        options.append("-use-fast-math")
+
+    fatbin = mxcc.compile_maca(
+        code,
+        compile_format,
+        arch,
+        options=options,
+        verbose=False,
+    )
+
+    return fatbin
 
 
 def extrac_params(func: tir.PrimFunc) -> list[KernelParam]:

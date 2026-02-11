@@ -135,6 +135,14 @@ def _find_rocm_home() -> str:
 
 def _find_maca_home() -> str:
     maca_home = os.environ.get("MACA_PATH") or os.environ.get("MACA_HOME")
+    if maca_home is None:
+        mxcc_path = shutil.which("mxcc")
+        if mxcc_path is not None:
+            maca_home = os.path.dirname(os.path.dirname(mxcc_path))
+        else:
+            maca_home = "/opt/maca"
+            if not os.path.exists(maca_home):
+                maca_home = None
     return maca_home if maca_home is not None else ""
 
 

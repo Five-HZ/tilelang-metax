@@ -82,14 +82,8 @@ def resolve_execution_backend(requested: str | None, target: Target) -> str:
         if is_cutedsl_target(target):
             return "cutedsl"
         kind = _target_kind(target)
-        if kind == "cuda" or kind == "metal":
+        if kind in {"cuda", "metal", "maca"}:
             choice = "tvm_ffi"
-        elif kind == "maca":
-            # TODO: Using tvm_ffi default
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.warning("default backend for maca target should be tvm_ffi")
-            choice = "cython"
         else:
             choice = "cython"
         # If the chosen default is not available (very rare), fall back to first available
