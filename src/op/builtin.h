@@ -55,6 +55,12 @@ static constexpr const char *kEnableVectorizePlannerVerbose =
     "tl.enable_vectorize_planner_verbose";
 static constexpr const char *kDisableWGMMA = "tl.disable_wgmma";
 static constexpr const char *kDisableShuffleElect = "tl.disable_shuffle_elect";
+static constexpr const char *kDisableLoopUnswitching =
+    "tl.disable_loop_unswitching";
+// Allow loop unswitching even when the else-version of the loop body is
+// non-trivial (has side effects). Default: false (conservative).
+static constexpr const char *kLoopUnswitchingAllowNonTrivialElse =
+    "tl.loop_unswitching_allow_non_trivial_else";
 
 /*!
  * \brief Enable lowering non-predicated global load/store to ldg/stg intrinsics
@@ -111,6 +117,9 @@ static constexpr const char *kDisableThreadStorageSync =
  *
  */
 static constexpr const char *kForceLetInline = "tl.force_let_inline";
+
+static constexpr const char *kDisableOutOfBoundWarning =
+    "tl.disable_out_of_bound_warning";
 
 /*!
  * \brief Get the type of the CUDA tensor map

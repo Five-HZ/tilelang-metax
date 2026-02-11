@@ -279,8 +279,8 @@ public:
                   << ")" << "\n";
       }
       // vector_size may be greater than local/fragment buffers' vector_size.
-      // In such case, we need to re-validate if the indices are invariant
-      // at the new vector_size boundary. If not invariant, take GCD.
+      // In such case, we need to re-validate if the indices are vectorizable
+      // at the new vector_size boundary. If not, take GCD.
       for (const auto &info : local_fragment_buffers) {
         if (vector_size_ > info.vector_size && !info.indices.empty()) {
           // Compute elem_offset from indices and strides
@@ -289,8 +289,9 @@ public:
           for (size_t i = 0; i < info.indices.size(); ++i) {
             elem_offset += info.indices[i] * strides[i];
           }
-          if (!IsExprInvariantInVectorBoundary(
-                  elem_offset, inner_for_->loop_var, vector_size_, analyzer_)) {
+          if (!IndicesCanVectorize(elem_offset, inner_for_->loop_var,
+                                   inner_for_->extent, vector_size_,
+                                   analyzer_)) {
             // Not invariant at this vector_size, need to take GCD
             int old_vector_size = vector_size_;
             vector_size_ = arith::ZeroAwareGCD(vector_size_, info.vector_size);
@@ -578,9 +579,9 @@ private:
     }
     // 4. Try to find max vectorize size for this buffer
     while (buffer_vec_size > 1 &&
-           !IndiceCanVectorize(elem_offset, inner_for_->loop_var,
-                               inner_for_->extent, buffer_vec_size,
-                               analyzer_)) {
+           !IndicesCanVectorize(elem_offset, inner_for_->loop_var,
+                                inner_for_->extent, buffer_vec_size,
+                                analyzer_)) {
       buffer_vec_size /= 2;
     }
     return buffer_vec_size;
@@ -657,13 +658,26 @@ private:
         vmap.Set(fnode->loop_var, outer_var * vector_size_ + inner_var);
         Stmt body = Substitute(fnode->body, vmap);
         body = For(inner_var, 0, vector_size_, ForKind::kVectorized, body);
-        body = For(outer_var, 0, extent / vector_size_, fnode->kind, body,
+        // TileLang uses ForKind::kParallel in frontend SIMT loops. After
+        // vectorization, keep semantics equivalent but downgrade to serial so
+        // subsequent passes (e.g. pragma-unroll) can run.
+        ForKind outer_kind = fnode->kind;
+        if (outer_kind == ForKind::kParallel) {
+          outer_kind = ForKind::kSerial;
+        }
+        body = For(outer_var, 0, extent / vector_size_, outer_kind, body,
                    fnode->thread_binding, fnode->annotations, fnode->step,
                    fnode->span);
         return body;
       }
     } else {
-      return ret;
+      // Keep other loops intact, except for TileLang frontend "parallel" loops
+      // which should behave as serial loops after lowering.
+      For loop = ret.as<For>().value();
+      if (loop->kind == ForKind::kParallel) {
+        loop.CopyOnWrite()->kind = ForKind::kSerial;
+      }
+      return loop;
     }
   }
 
@@ -721,9 +735,10 @@ bool IsExprInvariantInVectorBoundary(const PrimExpr &expr, Var var,
   return false;
 }
 
-bool IndiceCanVectorize(const PrimExpr &expr, Var var,
-                        const PrimExpr &iter_var_size,
-                        int target_vectorized_size, arith::Analyzer *analyzer) {
+bool IndicesCanVectorize(const PrimExpr &expr, Var var,
+                         const PrimExpr &iter_var_size,
+                         int target_vectorized_size,
+                         arith::Analyzer *analyzer) {
   ICHECK(target_vectorized_size >= 1);
   if (target_vectorized_size == 1)
     return true;
@@ -778,6 +793,38 @@ bool IndiceCanVectorize(const PrimExpr &expr, Var var,
   }
 }
 
+namespace {
+
+/*!
+ * \brief Convert TIR parallel loops into serial loops.
+ *
+ * TileLang uses ForKind::kParallel in a few places as a frontend "SIMT loop"
+ * marker. When vectorize size resolves to 1 (i.e. no vectorization is applied),
+ * keeping these loops as kParallel can block later loop transforms that only
+ * apply to serial loops (e.g. pragma-unroll rewriting).
+ *
+ * This rewriter is intentionally conservative: it only downgrades kParallel to
+ * kSerial and leaves all other loop kinds untouched.
+ */
+class ParallelToSerialRewriter : public StmtExprMutator {
+private:
+  Stmt VisitStmt_(const ForNode *node) final {
+    Stmt visited = StmtExprMutator::VisitStmt_(node);
+    For loop = Downcast<For>(visited);
+    if (loop->kind == ForKind::kParallel) {
+      loop.CopyOnWrite()->kind = ForKind::kSerial;
+    }
+    return loop;
+  }
+};
+
+For ParallelToSerial(const For &loop) {
+  ParallelToSerialRewriter rewriter;
+  return Downcast<For>(rewriter(loop));
+}
+
+} // namespace
+
 For VectorizeLoop(const For &loop, const LayoutMap &layout_map,
                   int vectorize_hint) {
   if (vectorize_hint <= 0) {
@@ -786,7 +833,7 @@ For VectorizeLoop(const For &loop, const LayoutMap &layout_map,
     vectorize_hint = planner.Plan(loop);
   }
   if (vectorize_hint == 1)
-    return loop;
+    return ParallelToSerial(loop);
   auto rewriter = VectorizeRewriter(vectorize_hint);
   return Downcast<For>(rewriter(loop));
 }
@@ -798,7 +845,7 @@ For VectorizeLoop(const For &loop, arith::Analyzer *analyzer,
     vectorize_hint = planner.Plan(loop);
   }
   if (vectorize_hint == 1)
-    return loop;
+    return ParallelToSerial(loop);
   auto rewriter = VectorizeRewriter(vectorize_hint);
   return Downcast<For>(rewriter(loop));
 }
