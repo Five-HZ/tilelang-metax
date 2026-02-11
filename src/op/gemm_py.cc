@@ -133,11 +133,8 @@ GemmInst GemmPyNode::getGemmInst(int block_size, Target target) const {
     return GemmInst::kWGMMA;
   } else if (TargetIsCDNA(target)) {
     return GemmInst::kMFMA;
-  } else if (TargetIsCuda(target)) {
+  } else if (TargetIsCuda(target) || TargetIsMaca(target)) {
     return GemmInst::kMMA;
-  } else if (TargetIsMaca(target)) {
-    LOG(WARNING) << "GemmInst type should using kMMA for MACA target, now is kMFMA.";
-    return GemmInst::kMFMA;
   } else {
     ICHECK(0) << "Unsupported target for gemm: " << target->str();
     return GemmInst::kMMA; // This line will never be reached due to ICHECK, but
