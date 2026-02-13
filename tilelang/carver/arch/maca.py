@@ -16,7 +16,7 @@ class MACA(TileDevice):
         if isinstance(target, str):
             target = tvm.target.Target(target)
         self.target = target
-        device = tvm.maca(0)
+        device = tvm.device(tvm.ffi.DLDeviceType.kDLMACA, 0)
         if not device.exist:
             raise RuntimeError("Cannot find MACA device 0.")
         self.device: tvm.runtime.Device = device

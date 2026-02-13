@@ -10,8 +10,7 @@ from tilelang import tvm as tvm
 from tilelang import _ffi_api
 from tvm.target import Target
 from tvm.contrib import rocm
-from tvm.contrib import mxcc
-from tilelang.contrib import nvcc
+from tilelang.contrib import nvcc, mxcc
 
 SUPPORTED_TARGETS: dict[str, str] = {
     "auto": "Auto-detect CUDA/HIP/MACA/Metal based on availability.",

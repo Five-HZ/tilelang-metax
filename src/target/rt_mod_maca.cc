@@ -2,7 +2,7 @@
 
 #include "../transform/common/attr.h"
 #include "codegen_maca.h"
-#include "runtime/maca/maca_module.h"
+#include "maca_module.h"
 #include "runtime/meta_data.h"
 #include "runtime/pack_args.h"
 #include "tvm/ffi/base_details.h"

@@ -12,52 +12,6 @@ endif()
 
 message(STATUS "Using TVM source: ${TVM_SOURCE}")
 
-message(STATUS "Checking and switching TVM to tile-ai/tilelang_main")
-execute_process(
-  COMMAND git merge-base --is-ancestor tileai/tilelang_main HEAD
-  WORKING_DIRECTORY ${TVM_SOURCE}
-  RESULT_VARIABLE MERGE_CHECK_RESULT
-  OUTPUT_QUIET
-  ERROR_VARIABLE MERGE_CHECK_ERROR
-)
-if(NOT MERGE_CHECK_ERROR STREQUAL "" OR NOT MERGE_CHECK_RESULT EQUAL 0)
-  execute_process(
-    COMMAND git remote get-url tileai
-    WORKING_DIRECTORY ${TVM_SOURCE}
-    RESULT_VARIABLE TILEAI_REMOTE_EXIST
-    OUTPUT_QUIET
-    ERROR_VARIABLE REMOTE_CHECK_ERROR
-  )
-  if(NOT REMOTE_CHECK_ERROR STREQUAL "" OR NOT TILEAI_REMOTE_EXIST EQUAL 0)
-    execute_process(
-      COMMAND git remote add tileai http://github.com/tile-ai/tvm.git
-      WORKING_DIRECTORY ${TVM_SOURCE}
-      COMMAND_ERROR_IS_FATAL ANY
-    )
-  endif()
-  execute_process(
-    COMMAND git fetch --no-recurse-submodules tileai tilelang_main
-    WORKING_DIRECTORY ${TVM_SOURCE}
-    COMMAND_ERROR_IS_FATAL ANY
-  )
-  execute_process(
-    COMMAND git merge --allow-unrelated-histories -Xours tileai/tilelang_main
-    WORKING_DIRECTORY ${TVM_SOURCE}
-    COMMAND_ERROR_IS_FATAL ANY
-  )
-else()
-  message(STATUS "Already merged tileai/tilelang_main, skip all operations")
-endif()
-
-execute_process(
-  COMMAND git log --oneline -1
-  WORKING_DIRECTORY ${TVM_SOURCE}
-  OUTPUT_VARIABLE TVM_COMMIT
-  OUTPUT_STRIP_TRAILING_WHITESPACE
-  ERROR_QUIET
-)
-message(STATUS "TVM current commit: ${TVM_COMMIT}")
-
 set(TVM_INCLUDES
   ${TVM_SOURCE}/include
   ${TVM_SOURCE}/src
@@ -73,4 +27,45 @@ endif()
 
 if(EXISTS ${TVM_SOURCE}/3rdparty/tvm-ffi/3rdparty/dlpack/include)
   list(APPEND TVM_INCLUDES ${TVM_SOURCE}/3rdparty/tvm-ffi/3rdparty/dlpack/include)
+endif()
+
+# update 3rdparty/tvm/3rdparty/tvm-ffi for adding kDLMACA/kDLMACAHost
+set(dlpack_header "${TVM_SOURCE}/3rdparty/tvm-ffi/3rdparty/dlpack/include/dlpack/dlpack.h")
+file(READ "${dlpack_header}" FILE_CONTENTS)
+if(NOT FILE_CONTENTS MATCHES ".*kDLMACA.*")
+  string(REPLACE "} DLDeviceType;" "  kDLMACA = 19,\n  kDLMACAHost = 20,\n} DLDeviceType;" NEW_CONTENTS "${FILE_CONTENTS}")
+  file(WRITE "${dlpack_header}" "${NEW_CONTENTS}")
+endif()
+set(ffi_core_pyi "${TVM_SOURCE}/3rdparty/tvm-ffi/python/tvm_ffi/core.pyi")
+file(READ "${ffi_core_pyi}" FILE_CONTENTS)
+if(NOT FILE_CONTENTS MATCHES ".*kDLMACA.*")
+  string(REPLACE "kDLTrn = 17" "kDLTrn = 17\n    kDLMACA = 19\n    kDLMACAHost = 20" NEW_CONTENTS "${FILE_CONTENTS}")
+  file(WRITE "${ffi_core_pyi}" "${NEW_CONTENTS}")
+endif()
+set(ffi_container_tensor "${TVM_SOURCE}/3rdparty/tvm-ffi/include/tvm/ffi/container/tensor.h")
+file(READ "${ffi_container_tensor}" FILE_CONTENTS)
+if(NOT FILE_CONTENTS MATCHES ".*kDLMACA.*")
+  string(REPLACE "device.device_type == kDLROCMHost;" "device.device_type == kDLROCMHost ||\n         device.device_type == kDLMACA || device.device_type == kDLMACAHost;" NEW_CONTENTS "${FILE_CONTENTS}")
+  file(WRITE "${ffi_container_tensor}" "${NEW_CONTENTS}")
+endif()
+set(ffi_cython_base_pxi "${TVM_SOURCE}/3rdparty/tvm-ffi/python/tvm_ffi/cython/base.pxi")
+file(READ "${ffi_cython_base_pxi}" FILE_CONTENTS)
+if(NOT FILE_CONTENTS MATCHES ".*kDLMACA.*")
+  string(REPLACE "kDLTrn = 18" "kDLTrn = 18\n        kDLMACA = 19\n        kDLMACAHost = 20" NEW_CONTENTS "${FILE_CONTENTS}")
+  file(WRITE "${ffi_cython_base_pxi}" "${NEW_CONTENTS}")
+endif()
+set(ffi_cython_device_pxi "${TVM_SOURCE}/3rdparty/tvm-ffi/python/tvm_ffi/cython/device.pxi")
+file(READ "${ffi_cython_device_pxi}" FILE_CONTENTS)
+if(NOT FILE_CONTENTS MATCHES ".*kDLMACA.*")
+  string(REPLACE "kDLTrn = 17" "kDLTrn = 17\n    kDLMACA = 19\n    kDLMACAHost = 20" NEW_CONTENTS "${FILE_CONTENTS}")
+  string(REPLACE "DLDeviceType.kDLTrn: \"trn\"," "DLDeviceType.kDLTrn: \"trn\",\n      DLDeviceType.kDLMACA: \"maca\",\n      DLDeviceType.kDLMACAHost: \"maca_host\"," NEW_CONTENTS "${NEW_CONTENTS}")
+  string(REPLACE "\"trn\": DLDeviceType.kDLTrn," "\"trn\": DLDeviceType.kDLTrn,\n        \"maca\": DLDeviceType.kDLMACA," NEW_CONTENTS "${NEW_CONTENTS}")
+  file(WRITE "${ffi_cython_device_pxi}" "${NEW_CONTENTS}")
+endif()
+# update 3rdparty/tvm for adding kDLMACA/kDLMACAHost
+set(tvm_device_api_header "${TVM_SOURCE}/include/tvm/runtime/device_api.h")
+file(READ "${tvm_device_api_header}" FILE_CONTENTS)
+if (NOT FILE_CONTENTS MATCHES ".*kDLMACA.*")
+  string(REPLACE "default:" "case kDLMACA:\n      return \"maca\";\n    case kDLMACAHost:\n      return \"maca_host\";\n    default:" NEW_CONTENTS "${FILE_CONTENTS}")
+  file(WRITE "${tvm_device_api_header}" "${NEW_CONTENTS}")
 endif()

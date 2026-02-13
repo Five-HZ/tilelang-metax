@@ -332,12 +332,15 @@ elseif(USE_CUDA)
 
   list(APPEND TILE_LANG_INCLUDES ${CUDAToolkit_INCLUDE_DIRS})
 elseif(USE_MACA)
-  include(${TVM_SOURCE}/cmake/utils/FindMACA.cmake)
+  include(cmake/utils/FindMACA.cmake)
   find_maca(${USE_MACA})
   file(GLOB TILE_LANG_MACA_SRCS
     src/target/ptx.cc
     src/target/codegen_maca.cc
     src/target/rt_mod_maca.cc
+    src/target/maca_module.cc
+    src/target/maca_target_kind.cc
+    src/target/maca_device_api.cc
   )
   list(APPEND TILE_LANG_SRCS ${TILE_LANG_MACA_SRCS})
   list(APPEND TILE_LANG_INCLUDES ${MACA_INCLUDE_DIRS})

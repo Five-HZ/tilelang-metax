@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import re
 import os
 import subprocess
 from tilelang.env import MACA_HOME, TILELANG_TEMPLATE_PATH
@@ -148,6 +149,43 @@ def default_compile_options(compile_flags: list[str] | None = None) -> list[str]
             tokens = shlex.split(flag) if isinstance(flag, str) else [str(flag)]
             options.extend(tokens)
     return options
+
+
+@tvm_ffi.register_global_func("tvm_callback_maca_get_arch")
+def get_maca_arch(maca_path="/opt/maca"):
+    """Utility function to get the MetaX GPU architecture
+
+    Parameters
+    ----------
+    maca_path : str
+        The path to maca installation directory
+
+    Returns
+    -------
+    gpu_arch : str
+        The MetaX GPU architecture
+    """
+    gpu_arch = "xcore1000"
+    # check if maca is installed
+    if not os.path.exists(maca_path):
+        print("MACA not detected, using default xcore1000")
+        return gpu_arch
+    try:
+        # Execute macainfo command
+        macainfo_output = subprocess.check_output([f"{maca_path}/bin/macainfo"]).decode("utf-8")
+
+        # Use regex to match the "Name" field
+        match = re.search(r"Name:\s+(XCORE\d+[a-zA-Z]*)", macainfo_output)
+        if match:
+            gpu_arch = match.group(1)
+        return gpu_arch.lower()
+    except subprocess.CalledProcessError:
+        print(
+            f"Unable to execute macainfo command, \
+                please ensure MACA is installed and you have an MetaX GPU on your system.\
+                    using default {gpu_arch}."
+        )
+        return gpu_arch
 
 
 def find_maca_path():

@@ -8,12 +8,12 @@ import tempfile
 from typing import Any
 
 from tvm.target import Target
-from tvm.contrib.mxcc import get_maca_arch, find_maca_path
 
 from tilelang import tvm as tvm
 from tilelang.transform import PassConfigKey
 from tilelang.contrib.nvcc import get_nvcc_compiler, get_target_arch, get_target_compute_version
 from tilelang.contrib.rocm import find_rocm_path, get_rocm_arch
+from tilelang.contrib.mxcc import find_maca_path, get_maca_arch
 from tilelang.env import TILELANG_TEMPLATE_PATH
 
 from .utils import is_cpu_target, is_cuda_target, is_hip_target, is_maca_target
