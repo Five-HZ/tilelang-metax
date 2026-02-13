@@ -85,12 +85,9 @@ TileLang achieves exceptional performance across a variety of computational patt
 
 ## Installation
 
-### Prepare MACA SDK
-
-Check out 《曦云系列_通用计算GPU_快速上手指南》 from [Metax developer community](https://developer.metax-tech.com)
-
 ### Build from Source
-We currently provide three ways to install **tile-lang** from source:
+We currently provide several ways to install **tile-lang** from source:
+- [Install from Source (with MACA enabled)](./docs/get_started/Installation_maca.md#building-from-source)
 - [Install from Source (using your own TVM installation)](./docs/get_started/Installation.md#method-1-install-from-source-using-your-own-tvm-installation)
 - [Install from Source (using the bundled TVM submodule)](./docs/get_started/Installation.md#method-2-install-from-source-using-the-bundled-tvm-submodule)
 - [Install Using the Provided Script](./docs/get_started/Installation.md#method-3-install-using-the-provided-script)
