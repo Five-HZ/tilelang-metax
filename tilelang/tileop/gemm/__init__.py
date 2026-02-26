@@ -11,11 +11,9 @@ from .gemm_mma_sm70 import GemmMMASm70
 from .gemm_wgmma import GemmWGMMA
 from .gemm_tcgen05 import GemmTCGEN5
 from .gemm_mfma import GemmMFMA
-from .gemm_cutedsl import GemmCuTeDSL
 from .gemm_maca_mma import GemmMACAMMA
 from tilelang import _ffi_api
 from tilelang.utils.target import target_is_volta, target_is_maca
-from tilelang.jit.adapter.utils import is_cutedsl_target
 
 
 @tvm_ffi.register_global_func("tl.gemm_py.infer_layout")
@@ -157,10 +155,6 @@ class GemmPy(Node, Scriptable):
             NotImplementedError: If the instruction type is not supported
             ValueError: If the instruction type is unknown
         """
-        # CuTeDSL backend uses direct intrinsic call, bypass complex lowering
-        if is_cutedsl_target(target):
-            return GemmCuTeDSL
-
         if gemm_inst.is_mma():
             if target_is_volta(target):
                 return GemmMMASm70
@@ -173,7 +167,5 @@ class GemmPy(Node, Scriptable):
             return GemmTCGEN5
         elif gemm_inst.is_mfma():
             return GemmMFMA
-        elif gemm_inst.is_tcgen5mma():
-            raise NotImplementedError("TCGEN5MMA is not implemented")
         else:
             raise ValueError(f"Unsupported GEMM instruction: {gemm_inst}")
