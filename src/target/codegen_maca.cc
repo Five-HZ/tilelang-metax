@@ -1961,8 +1961,23 @@ void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
     os << "tl::warp_reduce_bitand(" << PrintExpr(op->args[0]) << ")";
   } else if (op->op.same_as(tl::warp_reduce_bitor())) {
     os << "tl::warp_reduce_bitor(" << PrintExpr(op->args[0]) << ")";
+  } else if (op->op.same_as(tl::atomic_add_elem_op())) {
+    std::string dst_ptr = PrintExpr(op->args[0]);
+    std::string src_value = PrintExpr(op->args[1]);
+    this->PrintIndent();
+    this->stream << "AtomicAdd(" << dst_ptr << ", " << src_value;
+    if (op->args.size() > 2) {
+      this->stream << ", " << PrintExpr(op->args[2]);
+    }
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::atomic_add_ret_elem_op())) {
+    os << "AtomicAddRet(" << PrintExpr(op->args[0]) << ", "
+       << PrintExpr(op->args[1]);
+    if (op->args.size() > 2) {
+      os << ", " << PrintExpr(op->args[2]);
+    }
+    os << ")";
   } else if (op->op.same_as(tl::atomic_addx2_elem_op())) {
-    // atomic_addx2_elem_op(dst_ptr, src_ptr[, memory_order])
     std::string dst_ptr = PrintExpr(op->args[0]);
     std::string src_ptr = PrintExpr(op->args[1]);
     this->PrintIndent();
