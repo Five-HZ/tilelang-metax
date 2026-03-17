@@ -18,16 +18,12 @@ from .mfma_layout import (
     shared_16x16_to_local_64x4_layout_B,
     shared_16x32_to_local_64x8_layout_A,
     shared_16x32_to_local_64x8_layout_B,
-    shared_16x64_to_local_64x16_layout_A,
-    shared_16x64_to_local_64x16_layout_B,
     thread_id_shared_access_64x1_to_16x4_layout_A,
     thread_id_shared_access_64x1_to_4x16_layout_B,
     thread_id_shared_access_64x4_to_16x16_layout_A,
     thread_id_shared_access_64x4_to_16x16_layout_B,
     thread_id_shared_access_64x8_to_16x32_layout_A,
     thread_id_shared_access_64x8_to_16x32_layout_B,
-    thread_id_shared_access_64x16_to_16x64_layout_A,
-    thread_id_shared_access_64x16_to_16x64_layout_B,
 )
 
 lift = convert
@@ -140,9 +136,8 @@ class TensorCoreIntrinEmitter:
         self.accum_dtype_abbrv = self._dtype_abbrv_lookup(accum_dtype)
 
     def _initialize_mma_prefix(self, k_dim=16):
-        in_dtype, out_dtype = self.a_dtype, self.accum_dtype
+        in_dtype = self.a_dtype
         M_DIM, N_DIM = self.M_DIM, self.N_DIM
-        out_dtype_abbrv = {T.float16: "f16", T.float32: "f32", T.int8: "i8", T.int32: "i32"}[out_dtype]
 
         in_dtype_key = str(in_dtype)
         if in_dtype_key.startswith("dtype('") and in_dtype_key.endswith("')"):
@@ -435,7 +430,7 @@ class TensorCoreIntrinEmitter:
             tx, warp_n, warp_m = self.extract_thread_binding(thread_binding)
             for i, j in T.grid(warp_rows, warp_cols):
                 for local_id in T.vectorized(local_size_out):
-                    row, col = T.meta_var(maca_mma_store_index_map(tx, local_id))
+                    row, col = T.meta_var(mfma_store_index_map(tx, local_id))
                     C_buf[
                         (pid_m * BLOCK_M + warp_m * warp_rows + i) * M_DIM + row, (pid_n * BLOCK_N + warp_n * warp_cols + j) * N_DIM + col
                     ] = C_local_buf[i * warp_cols * local_size_out + j * local_size_out + local_id]
