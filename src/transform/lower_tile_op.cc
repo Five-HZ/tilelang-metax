@@ -20,6 +20,7 @@
 #include "../op/operator.h"
 #include "../op/utils.h"
 #include "../target/utils.h"
+#include "ptx_async_copy_injector.h"
 
 #include "arith/ir_mutator_with_analyzer.h"
 #include "layout_reducer.h"
@@ -1003,8 +1004,10 @@ private:
 
     auto lowered = tile_op->Lower(
         LowerArgs{target_, thread_bounds, thread_var_->var, callback,
-                  layout_map_, buffer_remap_, let_var_to_expr},
+                  layout_map_, buffer_remap_, let_var_to_expr,
+                  /*in_pipeline=*/pipelined_depth_ > 0},
         analyzer_);
+
     return IRMutatorWithAnalyzer::VisitStmt(lowered);
   }
 
@@ -1051,8 +1054,23 @@ private:
                          .value();
     }
 
-    // First visit the body
+    bool enter_pipelined = false;
+    if (auto num_stages_anno = op->annotations.Get("num_stages")) {
+      const auto *imm = num_stages_anno->as<IntImmNode>();
+      ICHECK(imm) << "For annotation num_stages must be IntImm, but got "
+                  << num_stages_anno.value();
+      enter_pipelined = imm->value > 0;
+    }
+    if (enter_pipelined) {
+      ++pipelined_depth_;
+    }
+
+    // First visit the body.
     For for_node = Downcast<For>(arith::IRMutatorWithAnalyzer::VisitStmt_(op));
+    if (enter_pipelined) {
+      ICHECK_GT(pipelined_depth_, 0);
+      --pipelined_depth_;
+    }
 
     // Only process parallel loops
     if (op->kind != ForKind::kParallel) {
@@ -1077,37 +1095,55 @@ private:
       predicate = Downcast<PrimExpr>(
           op->annotations.Get(attr::kParallelLoopPredicate).value());
     }
+    bool parallel_prefer_async = false;
+    if (auto prefer_async_anno = op->annotations.Get(attr::kLoopPreferAsync)) {
+      if (auto prefer_async_bool = prefer_async_anno.value().try_cast<Bool>()) {
+        parallel_prefer_async = prefer_async_bool.value()->value;
+      } else {
+        LOG(WARNING) << "Loop annotation `" << attr::kLoopPreferAsync
+                     << "` expects Bool value (True/False), but got "
+                     << prefer_async_anno.value().GetTypeKey()
+                     << ". Ignore override.";
+      }
+    }
+    bool parallel_async_without_async_commit_wait = false;
+    if (auto no_commit_wait_anno =
+            op->annotations.Get(attr::kParallelAsyncWithoutAsyncCommitWait)) {
+      if (auto no_commit_wait_bool =
+              no_commit_wait_anno.value().try_cast<Bool>()) {
+        parallel_async_without_async_commit_wait =
+            no_commit_wait_bool.value()->value;
+      } else {
+        LOG(WARNING) << "Loop annotation `"
+                     << attr::kParallelAsyncWithoutAsyncCommitWait
+                     << "` expects Bool value (True/False), but got "
+                     << no_commit_wait_anno.value().GetTypeKey()
+                     << ". Ignore override.";
+      }
+    }
 
     auto root = tvm::ffi::GetRef<For>(op);
 
-    // Check if the loop stores into local buffers.
+    // Check if the loop writes to any non-local buffer.
+    // Thread partitioning is unnecessary when all stores target local buffers.
     // For example:
     //   for i in T.Parallel(1024):
     //     A_local[i] = A_global[i]
     // Here, A_local is a register-local buffer held independently by each
     // thread, so explicit thread binding is not required.
-    bool store_into_local = false;
-    PostOrderVisit(root, [&](const ObjectRef &obj) {
-      if (const auto *store = obj.as<BufferStoreNode>()) {
-        if (IsLocalBuffer(store->buffer)) {
-          store_into_local = true;
-        }
-      }
-    });
 
-    // Check if the loop only manipulates "local" buffers.
-    // for i in T.Parallel(1024):
-    //     A_local[i] = B_local[i]
-    // This indicates register usage and justifies skipping thread binding.
-    bool local_register_only = true;
+    // NOTE: For cases when stores to both local and non-local buffers exist
+    // (mixed case), we still conservatively assume that thread partitioning is
+    // needed. In such case, the programmer should carefully consider the
+    // access patterns of the mixed accesses to ensure correctness.
+
+    // Element-level intrinsics (e.g. atomic_add) pass non-local buffer
+    // pointers via tvm_access_ptr / tl::access_ptr inside CallNodes.
+    bool has_non_local_store = false;
     PostOrderVisit(root, [&](const ObjectRef &obj) {
       if (const auto *store = obj.as<BufferStoreNode>()) {
         if (!IsLocalBuffer(store->buffer)) {
-          local_register_only = false;
-        }
-      } else if (const auto *load = obj.as<BufferLoadNode>()) {
-        if (!IsLocalBuffer(load->buffer)) {
-          local_register_only = false;
+          has_non_local_store = true;
         }
       } else if (const auto *call = obj.as<CallNode>()) {
         if (call->op.same_as(builtin::tvm_access_ptr())) {
@@ -1117,16 +1153,24 @@ private:
             Var var = tvm::ffi::GetRef<Var>(buffer_var);
             auto it = buffer_map_.find(var);
             if (it != buffer_map_.end() && !IsLocalBuffer(it->second)) {
-              local_register_only = false;
+              has_non_local_store = true;
+            }
+          }
+        } else if (call->op.same_as(tl::access_ptr())) {
+          // tl::access_ptr format: (BufferLoad, extent, rw_mask)
+          if (const auto *load = call->args[0].as<BufferLoadNode>()) {
+            if (!IsLocalBuffer(load->buffer)) {
+              has_non_local_store = true;
             }
           }
         }
       }
     });
 
-    // Determine if this is a true parallel loop requiring thread partitioning.
-    // Skip partitioning for loops that only operate on local/register buffers.
-    bool parallel_loop = !local_register_only && !store_into_local;
+    // Determine if this is a true parallel loop requiring thread
+    // partitioning: parallel_loop = True if we need to partition the loop.
+    // Skip partitioning for loops that only have local stores.
+    bool parallel_loop = has_non_local_store;
 
     // Check if there are non-local buffer accesses (for vectorization decision)
     bool has_non_local = false;
@@ -1189,9 +1233,24 @@ private:
     bool should_vectorize =
         (has_non_local || has_cast_operations) && !has_reducer;
     // Lower the parallel loop using the common function
-    return LowerParallelLoop(for_node, loop_layout, thread_var_->var, analyzer_,
-                             layout_map_, predicate, parallel_loop,
-                             should_vectorize);
+    Stmt lowered = LowerParallelLoop(for_node, loop_layout, thread_var_->var,
+                                     analyzer_, layout_map_, predicate,
+                                     parallel_loop, should_vectorize);
+
+    // Only parallel-loop lowering needs PTX cp.async injection. Thread-level
+    // lowering does not require converting eligible global->shared copies to
+    // `tir.ptx_cp_async`.
+    if (TargetIsCuda(target_) && TargetHasAsyncCopy(target_)) {
+      tvm::transform::PassContext ctx = tvm::transform::PassContext::Current();
+      bool enable_auto_async_copy =
+          ctx->GetConfig<Bool>(kEnableAsyncCopy, Bool(true)).value();
+      bool should_enable_async_copy =
+          (enable_auto_async_copy && (pipelined_depth_ > 0)) ||
+          parallel_prefer_async;
+      lowered = InjectPTXAsyncCopy(lowered, should_enable_async_copy,
+                                   parallel_async_without_async_commit_wait);
+    }
+    return lowered;
   }
 
   Target target_;
@@ -1220,6 +1279,7 @@ private:
   // without recomputing indices, since swizzle is encoded in TMA descriptor
   // parameters rather than in memory indices.
   bool in_tma_context_{false};
+  int pipelined_depth_{0};
 };
 
 namespace transform {
