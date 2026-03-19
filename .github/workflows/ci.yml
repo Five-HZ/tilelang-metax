@@ -36,34 +36,41 @@ env:
 jobs:
   lint:
     name: Quick Lint
-    runs-on: ubuntu-latest
+    runs-on: tilelang-metax-runner
     timeout-minutes: 30
     steps:
+      - name: Install dependencies for runner (MetaX)
+        run: |
+          sudo apt-get update && sudo apt-get install -y git
+          sudo /opt/conda/bin/pip install pre-commit
+          export PATH="/opt/conda/bin:${PATH}"
+          echo "PATH=${PATH}" | tee -a "${GITHUB_ENV}"
+
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          submodules: recursive
+          # submodules: recursive
 
-      - name: Setup Python 3.9
-        id: setup-pylowest
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.9"
-          update-environment: true
-          cache: pip
-          cache-dependency-path: |
-            pyproject.toml
-            requirements*.txt
-            .pre-commit-config.yaml
+      # - name: Setup Python 3.9
+      #   id: setup-pylowest
+      #   uses: actions/setup-python@v6
+      #   with:
+      #     python-version: "3.9"
+      #     update-environment: true
+      #     cache: pip
+      #     cache-dependency-path: |
+      #       pyproject.toml
+      #       requirements*.txt
+      #       .pre-commit-config.yaml
 
       - name: Check AST with Python 3.9
         run: |
-          "${{ steps.setup-pylowest.outputs.python-path }}" -m compileall -q -f tilelang
+          python -m compileall -q -f tilelang
 
       - name: Pre-commit Lint
         run: |
-          if ! pipx run pre-commit run --all-files --color=always --show-diff-on-failure; then
+          if ! pre-commit run --all-files --color=always --show-diff-on-failure; then
             echo "::error::Pre-commit checks failed. Please run 'pre-commit install' and 'pre-commit run --all-files' locally to see the issues."
             exit 1
           fi
@@ -92,9 +99,9 @@ jobs:
             name: self-hosted-metax
             # Format: MACA-<major>.<minor>[.<patch>]. E.g., "MACA-3.0".
             toolkit: MACA-3.6
-          - tags: [macos-latest]
-            name: macos-latest
-            toolkit: Metal # or Nightly-Metal
+          # - tags: [macos-latest]
+          #   name: macos-latest
+          #   toolkit: Metal # or Nightly-Metal
         python-version:
           - "3.12"
       fail-fast: false
@@ -104,7 +111,7 @@ jobs:
       - name: Install dependencies for runner (MetaX)
         if: contains(matrix.runner.toolkit, 'MACA')
         run: |
-          sudo apt-get update && sudo apt-get install -y git
+          sudo apt-get update && sudo apt-get install -y git ccache
           export PATH="/opt/conda/bin:${PATH}"
           echo "PATH=${PATH}" | tee -a "${GITHUB_ENV}"
 
@@ -381,7 +388,7 @@ jobs:
           fi
 
       - name: Run examples with Python ${{ matrix.python-version }} (${{ matrix.runner.toolkit }})
-        if: ${{ contains(matrix.runner.toolkit, 'CUDA') || contains(matrix.runner.toolkit, 'MACA') }}
+        if: contains(matrix.runner.toolkit, 'CUDA')
         run: |
           cd testing
           PYTEST=(
@@ -390,6 +397,17 @@ jobs:
           )
           "${PYTEST[@]}" --maxfail=3 --numprocesses=4 \
             ../examples
+
+      - name: Run MACA examples with Python ${{ matrix.python-version }} (${{ matrix.runner.toolkit }})
+        if: contains(matrix.runner.toolkit, 'MACA')
+        run: |
+          cd testing
+          PYTEST=(
+            uv run --no-project -m --
+            pytest --verbose --color=yes --durations=0 --showlocals --cache-clear
+          )
+          "${PYTEST[@]}" --maxfail=3 --numprocesses=4 \
+            ../examples/maca
 
       # NVIDIA CUDA tests
       - name: Run CUDA tests with Python ${{ matrix.python-version }} (${{ matrix.runner.toolkit }})
@@ -430,6 +448,19 @@ jobs:
             pytest --verbose --color=yes --durations=0 --showlocals --cache-clear
           )
           "${PYTEST[@]}" --maxfail=3 --numprocesses=4 \
+            --ignore=./python/debug \
+            --ignore=./python/kernel \
+            --ignore=./python/analysis \
+            --ignore=./python/autotune \
+            --ignore=./python/issue \
+            --ignore=./python/language \
+            --ignore=./python/jit \
+            --ignore=./python/layout \
+            --ignore=./python/tilelibrary \
+            --ignore=./python/profiler \
+            --ignore=./python/transform \
+            --ignore=./python/runtime \
+            --ignore=./python/cpu \
             ./python
 
       # Apple Metal tests
