@@ -153,6 +153,10 @@ private:
                  iv->thread_tag == "threadIdx.z") {
         threadIdx_z_ext = op->value;
       }
+    } else if (op->attr_key == tl::attr::kMinBlocksPerSM) {
+      if (const IntImmNode *v = op->value.as<IntImmNode>()) {
+        min_blocks_per_sm = v->value;
+      }
     }
     StmtVisitor::VisitStmt_(op);
   }
@@ -161,6 +165,39 @@ public:
   PrimExpr threadIdx_x_ext = Integer(1);
   PrimExpr threadIdx_y_ext = Integer(1);
   PrimExpr threadIdx_z_ext = Integer(1);
+  int64_t min_blocks_per_sm = 1; // default to 1
+};
+
+class ClusterInfoExtractor : public tir::StmtVisitor {
+private:
+  void VisitStmt(const PrimFunc &f) {
+    if (f->GetAttr<Array<PrimExpr>>("cluster_dims").has_value()) {
+      launch_with_cluster = true;
+      auto cluster_dims = f->GetAttr<Array<PrimExpr>>("cluster_dims").value();
+      cluster_grid_x_ext = cluster_dims[0].as<IntImmNode>()->value;
+      cluster_grid_y_ext = cluster_dims[1].as<IntImmNode>()->value;
+      cluster_grid_z_ext = cluster_dims[2].as<IntImmNode>()->value;
+      ICHECK(cluster_grid_x_ext > 0 && cluster_grid_y_ext > 0 &&
+             cluster_grid_z_ext > 0);
+    }
+    StmtVisitor::VisitStmt(f->body);
+  }
+
+  bool launch_with_cluster = false;
+  int64_t cluster_grid_x_ext = 1;
+  int64_t cluster_grid_y_ext = 1;
+  int64_t cluster_grid_z_ext = 1;
+
+public:
+  std::optional<std::tuple<int64_t, int64_t, int64_t>>
+  extract(const PrimFunc &f) {
+    this->VisitStmt(f);
+    if (launch_with_cluster) {
+      return std::make_tuple(cluster_grid_x_ext, cluster_grid_y_ext,
+                             cluster_grid_z_ext);
+    }
+    return std::nullopt;
+  }
 };
 
 void CodeGenTileLangMACA::PrintExtraAttrs(const PrimFunc &f) {
@@ -177,7 +214,8 @@ void CodeGenTileLangMACA::PrintExtraAttrs(const PrimFunc &f) {
       // return
       return;
     }
-    stream << " __launch_bounds__(" << threadIdx_ext_int->value << ")";
+    stream << " __launch_bounds__(" << threadIdx_ext_int->value << ", "
+           << extractor.min_blocks_per_sm << ")";
   }
 }
 
@@ -1607,7 +1645,9 @@ void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(tl::tma_store_arrive())) {
     print_extern_call_stmt("tl::tma_store_arrive");
   } else if (op->op.same_as(tl::tma_store_wait())) {
-    print_extern_call_stmt("tl::tma_store_wait<0>");
+    int count = Downcast<IntImm>(op->args[0])->value;
+    this->PrintIndent();
+    this->stream << "tl::tma_store_wait<" << count << ">();\n";
   } else if (op->op.same_as(tl::warpgroup_arrive())) {
     print_extern_call_stmt("tl::warpgroup_arrive");
   } else if (op->op.same_as(tl::warpgroup_commit_batch())) {
@@ -2094,9 +2134,35 @@ void CodeGenTileLangMACA::VisitStmt_(const AttrStmtNode *op) {
     return;
   } else if (op->attr_key == "threadblock_swizzle_pattern") {
     this->PrintIndent();
-    const StringImmNode *pattern = op->value.as<StringImmNode>();
-    ICHECK(pattern);
-    this->stream << "const dim3 blockIdx = " << pattern->value << "();\n";
+    std::string func_name;
+    int panel_size = 0;
+    if (const auto *call = op->value.as<CallNode>()) {
+      if (call->op.same_as(tir::builtin::tvm_tuple()) &&
+          call->args.size() >= 2) {
+        const auto *name_node = call->args[0].as<StringImmNode>();
+        const auto *size_node = call->args[1].as<IntImmNode>();
+        ICHECK(name_node && size_node) << "threadblock_swizzle_pattern expects "
+                                       << "tvm_tuple(device_func, panel_size)";
+        func_name = name_node->value;
+        panel_size = static_cast<int>(size_node->value);
+      }
+    }
+    ICHECK(!func_name.empty() && panel_size > 0);
+    if (this->cluster_dims.has_value()) {
+      auto [cluster_grid_x_ext, cluster_grid_y_ext, cluster_grid_z_ext] =
+          this->cluster_dims.value();
+      ICHECK(cluster_grid_y_ext == 1 && cluster_grid_z_ext == 1)
+          << "Only support annonate threadblock swizzle for cluster on X "
+          << "dimension for now!";
+      ICHECK(panel_size % cluster_grid_x_ext == 0)
+          << "panel_size must be divisible by clusterDim.x";
+      this->stream << "const dim3 blockIdx = tl::" << func_name
+                   << "WithCluster<" << panel_size / cluster_grid_x_ext << ", "
+                   << cluster_grid_x_ext << ">();\n";
+    } else {
+      this->stream << "const dim3 blockIdx = tl::" << func_name << "<"
+                   << panel_size << ">();\n";
+    }
     this->VisitStmt(op->body);
     return;
   } else if (op->attr_key == "pragma_unroll_factor") {
@@ -2347,6 +2413,39 @@ void CodeGenTileLangMACA::VisitStmt_(const BufferStoreNode *op) {
       EndScope(vec_scope);
     }
   }
+}
+
+void CodeGenTileLangMACA::VisitExpr_(const ShuffleNode *op,
+                                     std::ostream &os) { // NOLINT(*)
+  // For bfloat16x2 / float16x2 construction from two scalar lanes, emit a
+  // proper pack instrinsic instead of the generic `uint(a, b)` produced by
+  // the base CodeGenC which is not valid MACA.
+  DataType t = op->dtype;
+  bool is_bf16x2 = t.is_bfloat16() && t.lanes() == 2;
+  bool is_fp16x2 = t.is_float16() && t.lanes() == 2;
+  if ((is_bf16x2 || is_fp16x2) && op->vectors.size() == 2 &&
+      op->vectors[0].dtype().lanes() == 1 &&
+      op->vectors[1].dtype().lanes() == 1) {
+    // Collect the two scalar element expressions.
+    std::string e0 = PrintExpr(op->vectors[0]);
+    std::string e1 = PrintExpr(op->vectors[1]);
+    if (is_bf16x2) {
+      enable_bf16_ = true;
+      // __pack_maca_bfloat162(bfloat16_t, bfloat16_t) -> unsigned (32-bit)
+      // Use aggregate initialisation of uint1 (struct { unsigned x; })
+      // to avoid taking the address of a temporary.
+      os << "uint1{__pack_maca_bfloat162(" << e0 << ", " << e1 << ")}";
+    } else {
+      enable_fp16_ = true;
+      // __pack_half2 returns __half2 which is 32-bit.
+      // Reinterpret via aggregate initialisation.
+      os << "uint1{*(unsigned)&(__pack_half2((__half)(" << e0 << "), (__half)("
+         << e1 << ")))}";
+    }
+    return;
+  }
+  // Default path for all other types.
+  CodeGenC::VisitExpr_(op, os);
 }
 
 void CodeGenTileLangMACA::VisitExpr_(const BroadcastNode *op,
@@ -2821,6 +2920,9 @@ void CodeGenTileLangMACA::AddFunction(const GlobalVar &gvar,
   this->PrintFuncPrefix(stream);
   CodeGenC::PrintType(f->ret_type, stream);
   this->PrintExtraAttrs(f);
+
+  // Record cluster dimensions for usage in threadblock swizzle codegen
+  this->cluster_dims = ClusterInfoExtractor().extract(f);
 
   this->stream << " " << static_cast<std::string>(global_symbol.value()) << "(";
 
