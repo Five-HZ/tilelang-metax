@@ -901,9 +901,6 @@ std::string CodeGenTileLangMACA::CastFromTo(std::string value, DataType from,
     }
     os << "int)";
   }
-  if ((from.is_float16() || from.is_bfloat16()) && target.is_float8()) {
-    os << "(float)";
-  }
   os << value << ")";
   return os.str();
 }
