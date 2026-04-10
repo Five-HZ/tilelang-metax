@@ -77,7 +77,7 @@ def run_ieee_math_test(
     kernel = tilelang.compile(
         main_func,
         out_idx=out_idx,
-        target="cuda",
+        target="maca",
         pass_configs={
             tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: False,
         },
@@ -135,7 +135,6 @@ def test_rounding_mode_validation():
     print("✓ Rounding mode validation test passed")
 
 
-@tilelang.testing.requires_cuda
 @pytest.mark.parametrize("mode", ROUNDING_MODES, ids=ROUNDING_MODES)
 def test_ieee_add_all_rounding_modes(mode):
     """Test IEEE addition with all rounding modes"""
@@ -143,7 +142,6 @@ def test_ieee_add_all_rounding_modes(mode):
     print(f"✓ ieee_add with {mode} passed")
 
 
-@tilelang.testing.requires_cuda
 @pytest.mark.parametrize("mode", ROUNDING_MODES, ids=ROUNDING_MODES)
 def test_ieee_sub_all_rounding_modes(mode):
     """Test IEEE subtraction with all rounding modes"""
@@ -151,7 +149,6 @@ def test_ieee_sub_all_rounding_modes(mode):
     print(f"✓ ieee_sub with {mode} passed")
 
 
-@tilelang.testing.requires_cuda
 @pytest.mark.parametrize("mode", ROUNDING_MODES, ids=ROUNDING_MODES)
 def test_ieee_mul_all_rounding_modes(mode):
     """Test IEEE multiplication with all rounding modes"""
@@ -159,7 +156,6 @@ def test_ieee_mul_all_rounding_modes(mode):
     print(f"✓ ieee_mul with {mode} passed")
 
 
-@tilelang.testing.requires_cuda
 @pytest.mark.parametrize("mode", ROUNDING_MODES, ids=ROUNDING_MODES)
 def test_ieee_fmaf_all_rounding_modes(mode):
     """Test IEEE fused multiply-add with all rounding modes"""
@@ -167,7 +163,6 @@ def test_ieee_fmaf_all_rounding_modes(mode):
     print(f"✓ ieee_fmaf with {mode} passed")
 
 
-@tilelang.testing.requires_cuda
 @pytest.mark.parametrize("mode", ROUNDING_MODES, ids=ROUNDING_MODES)
 def test_ieee_frcp_all_rounding_modes(mode):
     """Test IEEE reciprocal with all rounding modes"""
@@ -175,7 +170,6 @@ def test_ieee_frcp_all_rounding_modes(mode):
     print(f"✓ ieee_frcp with {mode} passed")
 
 
-@tilelang.testing.requires_cuda
 @pytest.mark.parametrize("mode", ROUNDING_MODES, ids=ROUNDING_MODES)
 def test_ieee_fsqrt_all_rounding_modes(mode):
     """Test IEEE square root with all rounding modes"""
@@ -183,7 +177,6 @@ def test_ieee_fsqrt_all_rounding_modes(mode):
     print(f"✓ ieee_fsqrt with {mode} passed")
 
 
-@tilelang.testing.requires_cuda
 def test_ieee_frsqrt_rn_only():
     """Test IEEE reciprocal square root (round to nearest only)"""
 
@@ -199,7 +192,7 @@ def test_ieee_frsqrt_rn_only():
     kernel = tilelang.compile(
         main,
         out_idx=[1],
-        target="cuda",
+        target="maca",
         pass_configs={
             tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: False,
         },
@@ -219,7 +212,6 @@ def test_ieee_frsqrt_rn_only():
         print(f"Warning: ieee_frsqrt execution failed: {e}")
 
 
-@tilelang.testing.requires_cuda
 @pytest.mark.parametrize("mode", ROUNDING_MODES, ids=ROUNDING_MODES)
 def test_ieee_fdiv_all_rounding_modes(mode):
     """Test IEEE division with all rounding modes"""

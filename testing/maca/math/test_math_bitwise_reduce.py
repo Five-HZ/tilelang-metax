@@ -100,7 +100,6 @@ def run_single_bitwise_reduce(
     print("✓ {} with clear={} test passed".format(name, clear))
 
 
-@tilelang.testing.requires_cuda
 def test_bitwise_reduce_ops():
     run_single_bitwise_reduce("reduce_bitand", T.reduce_bitand, clear=True)
     run_single_bitwise_reduce("reduce_bitor", T.reduce_bitor, clear=True)
