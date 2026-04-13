@@ -1,6 +1,5 @@
 import torch
 from tilelang import language as T
-import tilelang.testing
 
 B = 1
 S = 1024  # small but for test only.
@@ -164,7 +163,6 @@ def test_example_chunk_o_compilation():
     O_tilelang = kernel(Q, K, V, HIDDEN, G)  # noqa: F841
 
 
-@tilelang.testing.pytest.mark.xfail
 def test_example_chunk_o_bwd_compilation():
     from example_chunk_o_bwd import tilelang_chunk_o_bwd_dqkwg, prepare_input
 
@@ -319,4 +317,5 @@ def test_example_chunk_delta_bwd_compilation():
 
 
 if __name__ == "__main__":
-    tilelang.testing.main()
+    # tilelang.testing.main()
+    test_example_wy_fast_compilation()

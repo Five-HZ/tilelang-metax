@@ -163,6 +163,9 @@ def tilelang_callback_maca_compile(code, target, pass_config=None):
     if enable_fast_math:
         options.append("-use-fast-math")
 
+    if "--use_fast_math" in options:
+        options.remove("--use_fast_math")
+
     fatbin = mxcc.compile_maca(
         code,
         compile_format,
