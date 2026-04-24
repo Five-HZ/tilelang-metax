@@ -22,7 +22,9 @@
  */
 #include "maca_module.h"
 
+#include <cstddef>
 #include <dmlc/memory_io.h>
+#include <future>
 #include <mcr/mc_runtime_api.h>
 #include <tvm/ffi/extra/c_env_api.h>
 #include <tvm/ffi/function.h>
@@ -42,6 +44,13 @@
 
 namespace tvm {
 namespace runtime {
+
+inline void EnsureCurrentDeviceContext(int device_id) {
+  // Driver API entry points require a current context on this thread.
+  // `mcGetDevice` reports the logical device, but it does not guarantee the
+  // primary context is bound.
+  MACA_CALL(mcSetDevice(device_id));
+}
 
 // Module to support thread-safe multi-GPU execution.
 // mcModule_t is a per-GPU module
@@ -176,22 +185,89 @@ public:
                   size_t packed_nbytes) const {
     int device_id;
     MACA_CALL(mcGetDevice(&device_id));
+    EnsureCurrentDeviceContext(device_id);
+    ThreadWorkLoad wl = launch_param_config_.Extract(args);
+
     if (fcache_[device_id] == nullptr) {
       fcache_[device_id] = m_->GetFunc(device_id, func_name_);
     }
 
     mcStream_t strm =
         static_cast<mcStream_t>(TVMFFIEnvGetStream(kDLMACA, device_id));
+    mcError_t result;
 
-    ThreadWorkLoad wl = launch_param_config_.Extract(args);
+    ICHECK(wl.grid_dim(0) > 0 && wl.grid_dim(1) > 0 && wl.grid_dim(2) > 0)
+        << "CUDALaunch Error: grid dimension must be positive, but got"
+        << " grid=(" << wl.grid_dim(0) << "," << wl.grid_dim(1) << ","
+        << wl.grid_dim(2) << ")"
+        << " in kernel " << func_name_
+        << ". A zero grid dimension is often caused by a dynamic shape"
+        << " (e.g. num_tokens) being 0 at runtime.";
+
     void *config[] = {MC_LAUNCH_PARAM_BUFFER_POINTER, packed_args,
                       MC_LAUNCH_PARAM_BUFFER_SIZE, &packed_nbytes,
                       MC_LAUNCH_PARAM_END};
-    // MACA supports only extra_args.
-    MACA_DRIVER_CALL(mcModuleLaunchKernel(
-        fcache_[device_id], wl.grid_dim(0), wl.grid_dim(1), wl.grid_dim(2),
-        wl.block_dim(0), wl.block_dim(1), wl.block_dim(2), wl.dyn_shmem_size,
-        strm, nullptr, reinterpret_cast<void **>(&config)));
+    if (launch_param_config_.use_cooperative_launch()) {
+      mcLaunchConfigExtension launch_config;
+      launch_config.gridDimX = wl.grid_dim(0);
+      launch_config.gridDimY = wl.grid_dim(1);
+      launch_config.gridDimZ = wl.grid_dim(2);
+      launch_config.blockDimX = wl.block_dim(0);
+      launch_config.blockDimY = wl.block_dim(1);
+      launch_config.blockDimZ = wl.block_dim(2);
+      launch_config.sharedMemBytes = wl.dyn_shmem_size;
+      launch_config.hStream = strm;
+      mcLaunchAttribute attribute_ub[1];
+      attribute_ub[0].id = mcLaunchAttributeCooperative;
+      attribute_ub[0].val.cooperative = 1;
+      launch_config.attrs = attribute_ub;
+      launch_config.numAttrs = 1;
+      result =
+          mcModuleLaunchKernelEx(&launch_config, fcache_[device_id], nullptr,
+                                 reinterpret_cast<void **>(&config));
+    } else {
+      // MACA supports only extra_args.
+      result = mcModuleLaunchKernel(
+          fcache_[device_id], wl.grid_dim(0), wl.grid_dim(1), wl.grid_dim(2),
+          wl.block_dim(0), wl.block_dim(1), wl.block_dim(2), wl.dyn_shmem_size,
+          strm, nullptr, reinterpret_cast<void **>(&config));
+    }
+
+    if (result != mcSuccess && result != mcErrorDeinitialized) {
+      const char *msg = mcGetErrorName(result);
+      std::ostringstream os;
+      os << "MACALaunch Error: " << msg << "\n"
+         << " grid=(" << wl.grid_dim(0) << "," << wl.grid_dim(1) << ","
+         << wl.grid_dim(2) << "), "
+         << " block=(" << wl.block_dim(0) << "," << wl.block_dim(1) << ","
+         << wl.block_dim(2) << ")"
+         << " dyn_smem_bytes=" << wl.dyn_shmem_size;
+      std::string maca = m_->InspectSource("");
+      if (maca.length() != 0) {
+        os << "// func_name=" << func_name_ << "\n"
+           << "// MACA Source\n"
+           << "// -----------\n"
+           << maca;
+      }
+      LOG(FATAL) << os.str();
+    }
+
+    // Check for asynchronous MACA errors that mcLaunchKernel's return value
+    // does not capture (e.g. illegal memory access during kernel execution).
+    // This matches the Cython backend's TILELANG_CHECK_LAST_ERROR macro.
+    if (result == mcSuccess) {
+      mcError_t last_err = mcPeekAtLastError();
+      if (last_err != mcSuccess) {
+        // Use driver API mcGetErrorName for the error name (mcGetErrorName
+        // is not available in the cudart stub).
+        const char *err_name = mcGetErrorName(last_err);
+        const char *err_str = mcGetErrorString(last_err);
+        // Clear the sticky error so subsequent MACA calls are not poisoned.
+        mcGetLastError();
+        LOG(FATAL) << func_name_ << ": " << (err_name ? err_name : "unknown")
+                   << " - " << err_str;
+      }
+    }
   }
 
 private:
