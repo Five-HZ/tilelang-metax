@@ -86,7 +86,7 @@ jobs:
           #   name: self-hosted-amd
           #   # Format: [Nightly-]ROCm-<major>.<minor>[.<patch>]. E.g., "ROCm-6.4" or "Nightly-ROCm-7.0".
           #   # Use "Nightly-" prefix to use torch nightly builds.
-          #   toolkit: Nightly-ROCm-7.1
+          #   toolkit: Nightly-ROCm-7.2
           - tags: tilelang-metax-runner
             name: self-hosted-metax
             # Format: MACA-<major>.<minor>[.<patch>]. E.g., "MACA-3.0".
