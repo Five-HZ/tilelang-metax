@@ -164,10 +164,11 @@ def test_assert_tl_matmul():
     assert_tl_matmul_correctness(128, 256, 256, T.float16, T.float32, T.float32)
 
 
-@tilelang.testing.pytest.mark.xfail
 @tilelang.testing.requires_cuda
 def test_assert_tl_matmul_int8():
+    torch.backends.cuda.matmul.allow_tf32 = False
     assert_tl_matmul_correctness(128, 256, 256, T.int8, T.int32, T.int32)
+    torch.backends.cuda.matmul.allow_tf32 = True
 
 
 if __name__ == "__main__":
