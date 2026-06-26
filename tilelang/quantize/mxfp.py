@@ -195,10 +195,15 @@ def get_mxfp_intrin_group(
     assert source_format in [T.int, T.uint], f"Invalid source_format: {source_format}. Expected 'int' or 'uint'."
     assert storage_dtype in [T.int32, T.int8, T.uint8], f"Invalid storage_dtype: {storage_dtype}. Expected 'int32' or 'int8' or 'uint8'."
 
-    # Detect AMD gfx950 target to select the HIP C++ dequantization implementation.
+    # Detect AMD gfx950 / Maca targets to select portable C++ dequantization.
     # All other targets (NV, RDNA, MI300) use the default CUDA PTX path below.
     _is_gfx950 = False
+    _is_maca = False
     if target is not None:
+        from tvm.target import Target
+
+        tvm_target = target if isinstance(target, Target) else Target(target)
+        _is_maca = tvm_target.kind.name == "maca"
         try:
             from tilelang.rocm.target import target_is_gfx950
 
@@ -223,6 +228,17 @@ def get_mxfp_intrin_group(
             raise AssertionError(
                 f"AMD gfx950 MXFP dequant only supports source_bit=4 and out_dtype=bfloat16, "
                 f"got source_bit={source_bit}, out_dtype={out_dtype}"
+            )
+
+    elif _is_maca:
+        # Maca path: use portable C++ implementations (no CUDA PTX inline asm).
+        if use_twiddling and source_bit == 4 and out_dtype == T.bfloat16:
+            return {"func_name": func_name, "c_source": decode_f4_to_bf16_twiddling_hip}
+        elif not use_twiddling and source_bit == 4 and out_dtype == T.bfloat16:
+            return {"func_name": func_name, "c_source": decode_f4_to_bf16_simple_hip}
+        else:
+            raise AssertionError(
+                f"Maca MXFP dequant only supports source_bit=4 and out_dtype=bfloat16, got source_bit={source_bit}, out_dtype={out_dtype}"
             )
 
     # CUDA / default path: use PTX inline assembly implementations.
