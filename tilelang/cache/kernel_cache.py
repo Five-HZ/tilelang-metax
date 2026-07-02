@@ -7,6 +7,7 @@ import json
 import logging
 import errno
 import os
+import platform
 import shutil
 import threading
 import uuid
@@ -27,7 +28,6 @@ from tilelang.jit.adapter.base import CachedTextSource
 from tilelang.jit.diagnostics import jit_phase
 from tilelang.contrib.hip_resource_info import dump_to_file, load_from_file
 from tilelang import __version__
-import platform
 
 
 class KernelCache:
@@ -124,12 +124,12 @@ class KernelCache:
         return None
 
     @staticmethod
-    @functools.cache
     def _get_base_key() -> dict:
-        base = {"version": __version__, "platform": platform.machine()}
-        lib_stamp = KernelCache._get_tilelang_lib_stamp()
-        if lib_stamp:
-            base["tilelang_lib"] = lib_stamp
+        base = {"version": __version__}
+        if env.should_use_kernel_cache_lib_stamp():
+            lib_stamp = KernelCache._get_tilelang_lib_stamp()
+            if lib_stamp:
+                base["tilelang_lib"] = lib_stamp
         if sys.platform == "darwin":
             import torch
 
@@ -156,8 +156,9 @@ class KernelCache:
     def _get_cache_namespace() -> str:
         base_key = KernelCache._get_base_key()
         version = KernelCache._format_version_namespace(str(base_key.get("version", "unknown")))
-        platform_name = KernelCache._sanitize_path_component(str(base_key.get("platform", "unknown")))
-        return f"{version}-{platform_name}"
+        host_platform = KernelCache._sanitize_path_component(sys.platform)
+        host_machine = KernelCache._sanitize_path_component(platform.machine())
+        return os.path.join(version, f"{host_platform}-{host_machine}")
 
     def __new__(cls):
         """
@@ -246,8 +247,8 @@ class KernelCache:
             out_idx (List[int]): Indices specifying which outputs to return.
             execution_backend (Literal): Backend type for execution. Defaults to "tvm_ffi".
             args: Arguments passed to the function.
-            target (Union[str, Target]): Compilation target platform. Defaults to "auto".
-            target_host (Union[str, Target], optional): Host target platform.
+            target (Union[str, dict, Target]): Compilation target platform. Defaults to "auto".
+            target_host (Union[str, dict, Target], optional): Host target platform.
 
         Returns:
             str: SHA256 hash key for the kernel configuration.
@@ -291,7 +292,8 @@ class KernelCache:
         Args:
             func: Function to be compiled or a prepared PrimFunc
             out_idx: Indices specifying which outputs to return
-            target: Compilation target platform (None = read from TILELANG_TARGET env var)
+            target: Compilation target platform (None = read from TILELANG_DEFAULT_TARGET env var).
+                Use a dict for target attributes, for example {"kind": "cuda", "arch": "sm_90"}.
             target_host: Host target platform
             execution_backend: Execution backend (None = read from TILELANG_EXECUTION_BACKEND)
             verbose: Enable verbose output (None = read from TILELANG_VERBOSE)
@@ -302,8 +304,9 @@ class KernelCache:
 
         Environment Variables
         ---------------------
-        TILELANG_TARGET : str
-            Default compilation target (e.g., "cuda", "llvm"). Defaults to "auto".
+        TILELANG_DEFAULT_TARGET : str
+            Default compilation target (e.g., "cuda", "llvm", or a dict-like target config string).
+            Defaults to "auto".
         TILELANG_EXECUTION_BACKEND : str
             Default execution backend. Defaults to "auto".
         TILELANG_VERBOSE : str
@@ -550,8 +553,8 @@ class KernelCache:
 
         Args:
             key (str): The hash key identifying the kernel.
-            target (Union[str, Target]): Compilation target platform. Defaults to "auto".
-            target_host (Union[str, Target], optional): Host target platform.
+            target (Union[str, dict, Target]): Compilation target platform. Defaults to "auto".
+            target_host (Union[str, dict, Target], optional): Host target platform.
             out_idx (List[int], optional): Indices specifying which outputs to return.
             execution_backend (Literal): Backend type for execution. Defaults to "tvm_ffi".
             pass_configs (dict, optional): Configuration for compiler passes.
@@ -583,19 +586,29 @@ class KernelCache:
         except Exception:
             self.logger.exception("Error loading kernel parameters from disk")
 
-        kernel = self._build_kernel(
-            func=func,
-            host_kernel_source=CachedTextSource(path=host_kernel_path),
-            device_kernel_source=CachedTextSource(path=device_kernel_path),
-            kernel_lib_path=kernel_lib_path,
-            kernel_params=kernel_params,
-            target=target,
-            target_host=target_host,
-            out_idx=out_idx,
-            execution_backend=execution_backend,
-            pass_configs=pass_configs,
-            compile_flags=compile_flags,
-        )
+        try:
+            kernel = self._build_kernel(
+                func=func,
+                host_kernel_source=CachedTextSource(path=host_kernel_path),
+                device_kernel_source=CachedTextSource(path=device_kernel_path),
+                kernel_lib_path=kernel_lib_path,
+                kernel_params=kernel_params,
+                target=target,
+                target_host=target_host,
+                out_idx=out_idx,
+                execution_backend=execution_backend,
+                pass_configs=pass_configs,
+                compile_flags=compile_flags,
+            )
+        except Exception as err:
+            self.logger.warning(
+                "Failed to load kernel from disk cache at %s; treating it as a cache miss: %s",
+                cache_path,
+                err,
+                exc_info=verbose,
+            )
+            shutil.rmtree(cache_path, ignore_errors=True)
+            return None
         if kernel is not None:
             # Restore parsed kernel-resource-usage if a previous compile
             # persisted it; absent file is fine (older caches, non-HIP).

@@ -137,10 +137,16 @@ TL_DEVICE unsigned __pack_nv_bfloat162(const bfloat16_t x, const bfloat16_t y) {
   return (v1 << 16) | v0;
 }
 
-// Pack four char values.
+// Pack four char values. Build the 32-bit pattern from unsigned bytes: a
+// negative signed char would otherwise sign-extend and flood the other lanes
+// through the OR.
 TL_DEVICE int make_int(signed char x0, signed char x1, signed char x2,
                        signed char x3) {
-  return (x3 << 24) | (x2 << 16) | (x1 << 8) | x0;
+  const unsigned int b0 = static_cast<unsigned char>(x0);
+  const unsigned int b1 = static_cast<unsigned char>(x1);
+  const unsigned int b2 = static_cast<unsigned char>(x2);
+  const unsigned int b3 = static_cast<unsigned char>(x3);
+  return static_cast<int>((b3 << 24) | (b2 << 16) | (b1 << 8) | b0);
 }
 
 // Pack eight char values.
@@ -182,6 +188,13 @@ TL_DEVICE int4_t make_int4(short x0, short x1, short y0, short y1, short z0,
 TL_DEVICE unsigned int make_uint(unsigned char x0, unsigned char x1,
                                  unsigned char x2, unsigned char x3) {
   return (x3 << 24) | (x2 << 16) | (x1 << 8) | x0;
+}
+
+template <typename T> TL_DEVICE unsigned int pack_b8x4(T x0, T x1, T x2, T x3) {
+  return make_uint(*reinterpret_cast<unsigned char *>(&x0),
+                   *reinterpret_cast<unsigned char *>(&x1),
+                   *reinterpret_cast<unsigned char *>(&x2),
+                   *reinterpret_cast<unsigned char *>(&x3));
 }
 
 // Pack eight char values.
@@ -417,8 +430,8 @@ union GmmaDescriptor {
   template <typename T>
   CUTE_HOST_DEVICE constexpr GmmaDescriptor operator+(const T &offset) const {
     GmmaDescriptor ret;
-    ret.reg32_[0] = reg32_[0] + uint32_t(offset);
-    ret.reg32_[1] = reg32_[1];
+    ret.desc_ = desc_;
+    ret.reg32_[0] += uint32_t(offset);
     return ret;
   }
 };
@@ -480,9 +493,9 @@ union Tcgen05SMemDescriptor {
   CUTE_HOST_DEVICE constexpr Tcgen05SMemDescriptor
   operator+(const T &offset) const {
     Tcgen05SMemDescriptor ret;
+    ret.desc_ = desc_;
     // Address addition is in units of 16 bytes (4 LSB not encoded)
-    ret.reg32_[0] = reg32_[0] + (uint32_t(offset) >> 4);
-    ret.reg32_[1] = reg32_[1];
+    ret.reg32_[0] += uint32_t(offset) >> 4;
     return ret;
   }
 };
