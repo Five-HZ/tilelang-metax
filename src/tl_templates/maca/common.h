@@ -157,44 +157,42 @@ template <> struct numeric_limits<maca_bfloat16> {
   static int const digits = 7;
 
   /// Least positive value
-  __device__ static mctlass::bfloat16_t min() {
-    return mctlass::bfloat16_t::bitcast(0x01);
+  __device__ static maca_bfloat16 min() {
+    return maca_bfloat16(__maca_bfloat16_raw{0x01});
   }
 
   /// Minimum finite value
-  __device__ static mctlass::bfloat16_t lowest() {
-    return mctlass::bfloat16_t::bitcast(0xff7f);
+  __device__ static maca_bfloat16 lowest() {
+    return maca_bfloat16(__maca_bfloat16_raw{0xff7f});
   }
 
   /// Maximum finite value
-  __device__ static mctlass::bfloat16_t max() {
-    return mctlass::bfloat16_t::bitcast(0x7f7f);
+  __device__ static maca_bfloat16 max() {
+    return maca_bfloat16(__maca_bfloat16_raw{0x7f7f});
   }
 
   /// Returns smallest finite value
-  __device__ static mctlass::bfloat16_t epsilon() {
-    return mctlass::bfloat16_t::bitcast(0x1000);
+  __device__ static maca_bfloat16 epsilon() {
+    return maca_bfloat16(__maca_bfloat16_raw{0x1000});
   }
 
   /// Returns maximum rounding error
-  __device__ static mctlass::bfloat16_t round_error() {
-    return mctlass::bfloat16_t(0.5f);
-  }
+  __device__ static maca_bfloat16 round_error() { return maca_bfloat16(0.5f); }
   /// Returns positive infinity value
-  __device__ static mctlass::bfloat16_t infinity() {
-    return mctlass::bfloat16_t::bitcast(0x7f80);
+  __device__ static maca_bfloat16 infinity() {
+    return maca_bfloat16(__maca_bfloat16_raw{0x7f80});
   }
   /// Returns quiet NaN value
-  __device__ static mctlass::bfloat16_t quiet_NaN() {
-    return mctlass::bfloat16_t::bitcast(0x7fff);
+  __device__ static maca_bfloat16 quiet_NaN() {
+    return maca_bfloat16(__maca_bfloat16_raw{0x7fff});
   }
   /// Returns signaling NaN value
-  __device__ static mctlass::bfloat16_t signaling_NaN() {
-    return mctlass::bfloat16_t::bitcast(0x7fff);
+  __device__ static maca_bfloat16 signaling_NaN() {
+    return maca_bfloat16(__maca_bfloat16_raw{0x7fff});
   }
   /// Returns smallest positive subnormal value
-  __device__ static mctlass::bfloat16_t denorm_min() {
-    return mctlass::bfloat16_t::bitcast(0x1);
+  __device__ static maca_bfloat16 denorm_min() {
+    return maca_bfloat16(__maca_bfloat16_raw{0x1});
   }
 };
 } // namespace platform
@@ -313,11 +311,19 @@ template <typename T> TL_DEVICE void AtomicAdd(_Float16 *address, T val) {
 }
 
 TL_DEVICE half_t max(const half_t a, const half_t b) {
-  return mctlass::fast_max(a, b);
+  return half_t(__hmax(a, b));
 }
 
 TL_DEVICE half_t min(const half_t a, const half_t b) {
-  return mctlass::fast_min(a, b);
+  return half_t(__hmin(a, b));
+}
+
+TL_DEVICE bfloat16_t max(const bfloat16_t a, const bfloat16_t b) {
+  return __hmax(a, b);
+}
+
+TL_DEVICE bfloat16_t min(const bfloat16_t a, const bfloat16_t b) {
+  return __hmin(a, b);
 }
 
 // DP4A
@@ -392,18 +398,96 @@ TL_DEVICE void __sync_thread_partial() {
 //
 namespace tl {
 
-// Generic passthroughs
+template <int LaneMask> TL_DEVICE uint32_t shfl_xor_u32_imm(uint32_t v) {
+  static_assert(LaneMask == 1 || LaneMask == 2 || LaneMask == 4 ||
+                    LaneMask == 8,
+                "unsupported row-local XOR lane mask");
+  if constexpr (LaneMask == 1) {
+    // Quad permutation: [0, 1, 2, 3] -> [1, 0, 3, 2].
+    return static_cast<uint32_t>(__builtin_mxc_update_shfl(
+        static_cast<int>(v), static_cast<int>(v), 0x0b1, 0xf, 0xf, false));
+  } else if constexpr (LaneMask == 2) {
+    // Quad permutation: [0, 1, 2, 3] -> [2, 3, 0, 1].
+    return static_cast<uint32_t>(__builtin_mxc_update_shfl(
+        static_cast<int>(v), static_cast<int>(v), 0x04e, 0xf, 0xf, false));
+  } else if constexpr (LaneMask == 4) {
+    // XOR 4 within a 16-lane row is two masked row shifts:
+    // banks 0/2 read from +4, banks 1/3 read from -4.
+    uint32_t out = v;
+    out = static_cast<uint32_t>(__builtin_mxc_update_shfl(
+        static_cast<int>(out), static_cast<int>(v), 0x104, 0xf, 0x5, false));
+    out = static_cast<uint32_t>(__builtin_mxc_update_shfl(
+        static_cast<int>(out), static_cast<int>(v), 0x114, 0xf, 0xa, false));
+    return out;
+  } else if constexpr (LaneMask == 8) {
+    // Row rotate right by 8 is equivalent to XOR 8 within a 16-lane row.
+    return static_cast<uint32_t>(__builtin_mxc_update_shfl(
+        static_cast<int>(v), static_cast<int>(v), 0x128, 0xf, 0xf, false));
+  } else {
+    return v;
+  }
+}
+
+template <int LaneMask, typename T> TL_DEVICE T shfl_xor_imm(T val) {
+  if constexpr (sizeof(T) <= sizeof(uint32_t)) {
+    uint32_t bits = 0;
+    __builtin_memcpy(&bits, &val, sizeof(T));
+    bits = shfl_xor_u32_imm<LaneMask>(bits);
+    T out;
+    __builtin_memcpy(&out, &bits, sizeof(T));
+    return out;
+  } else if constexpr (sizeof(T) == 2 * sizeof(uint32_t)) {
+    uint32_t bits[2];
+    __builtin_memcpy(bits, &val, sizeof(T));
+    bits[0] = shfl_xor_u32_imm<LaneMask>(bits[0]);
+    bits[1] = shfl_xor_u32_imm<LaneMask>(bits[1]);
+    T out;
+    __builtin_memcpy(&out, bits, sizeof(T));
+    return out;
+  } else {
+    return val;
+  }
+}
+
 template <typename T>
-TL_DEVICE T shfl_xor_sync(uint64_t mask, T val, int laneMask) {
+TL_DEVICE T shfl_xor_sync_fallback(uint64_t mask, T val, int laneMask) {
   return __shfl_xor_sync(mask, val, laneMask);
 }
 
-// Specializations for mctlass::half_t
 template <>
-TL_DEVICE half_t shfl_xor_sync(uint64_t mask, half_t val, int laneMask) {
+TL_DEVICE half_t shfl_xor_sync_fallback(uint64_t mask, half_t val,
+                                        int laneMask) {
   float f = static_cast<float>(val);
   float r = __shfl_xor_sync(mask, f, laneMask);
   return half_t(r);
+}
+
+template <>
+TL_DEVICE uint1 shfl_xor_sync_fallback(uint64_t mask, uint1 val, int laneMask) {
+  unsigned long raw = static_cast<unsigned long>(val.x);
+  unsigned long result = __shfl_xor_sync(mask, raw, laneMask);
+  return uint1{static_cast<unsigned int>(result)};
+}
+
+template <typename T>
+TL_DEVICE T shfl_xor_sync(uint64_t mask, T val, int laneMask) {
+  if constexpr (sizeof(T) <= 2 * sizeof(uint32_t)) {
+    if (mask == uint64_t(-1)) {
+      switch (laneMask) {
+      case 1:
+        return shfl_xor_imm<1>(val);
+      case 2:
+        return shfl_xor_imm<2>(val);
+      case 4:
+        return shfl_xor_imm<4>(val);
+      case 8:
+        return shfl_xor_imm<8>(val);
+      default:
+        break;
+      }
+    }
+  }
+  return shfl_xor_sync_fallback(mask, val, laneMask);
 }
 
 } // namespace tl
@@ -432,6 +516,21 @@ template <typename T> TL_DEVICE ::uint1 to_uint1(T v) {
 //   2. maca_bfloat162  (BF16x2, MACA SDK __h*2 intrinsics)
 //   3. half2           (FP16x2, MACA SDK __h*2 intrinsics)
 // =========================================================================
+// Pack two half_t into a uint1
+TL_DEVICE uint1 pack_half2(half_t a, half_t b) {
+  return __pack_half2(static_cast<__half>(a), static_cast<__half>(b));
+}
+
+// Helper to extract half_t from float16x2 (which uses _Float16)
+TL_DEVICE half_t extract_half_from_float16x2(float16x2 v, int lane) {
+  // float16x2 is a vector of _Float16, convert to half_t via float
+  return half_t(static_cast<float>(v[lane]));
+}
+
+// Helper to extract bfloat16_t from bfloat16x2
+TL_DEVICE bfloat16_t extract_bfloat16_from_bfloat16x2(bfloat16x2 v, int lane) {
+  return v.data[lane];
+}
 
 // --- add2 ----------------------------------------------------------------
 
