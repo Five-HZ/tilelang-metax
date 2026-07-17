@@ -63,7 +63,6 @@ def test_cast_sat_bool():
 
 
 @tilelang.testing.requires_cuda
-@tilelang.testing.requires_cuda_compute_version_ge(8, 9)
 def test_cast_default_unchanged():
     """Test that T.cast without rounding params still uses __nv_cvt_float2_to_fp8x2."""
     M = 256
@@ -87,8 +86,8 @@ def test_cast_default_unchanged():
 
     kernel = default_cast_kernel(M)
     code = kernel.get_kernel_source()
-    assert "__nv_cvt_float2_to_fp8x2" in code, (
-        f"Default cast should use __nv_cvt_float2_to_fp8x2 for backward compatibility.\nGenerated code:\n{code}"
+    assert "__maca_cvt_float2_to_fp8x2" in code, (
+        f"Default cast should use __maca_cvt_float2_to_fp8x2 for backward compatibility.\nGenerated code:\n{code}"
     )
 
 
