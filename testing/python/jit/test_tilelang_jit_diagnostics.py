@@ -141,6 +141,7 @@ def test_nvcc_compile_cuda_honors_tilelang_timeout(monkeypatch):
 
 
 @tilelang.testing.skip_on_maca
+@tilelang.testing.requires_cuda
 def test_nvcc_target_code_list_parser():
     from tilelang.contrib.nvcc import get_target_code_list
 
@@ -208,6 +209,7 @@ def test_cuda_compile_callback_uses_fatbin_for_multiple_target_code(monkeypatch)
 
 
 @tilelang.testing.skip_on_maca
+@tilelang.testing.requires_cuda
 def test_jit_compile_reports_timeout_for_hanging_nvcc(monkeypatch, tmp_path, caplog, capture_tilelang_logs):
     import tilelang
     from tilelang.contrib import nvcc
@@ -309,6 +311,7 @@ def test_kernel_cache_miss_compile_logs_context(monkeypatch, tmp_path, caplog, c
 
 
 @tilelang.testing.skip_on_maca
+@tilelang.testing.requires_cuda
 def test_explicit_cuda_arch_source_generation_probe():
     import tilelang
     from tilelang import tvm

@@ -320,6 +320,27 @@ TL_DEVICE float2 AtomicAddx2Ret(float *ref, ValType val, int memory_order = 0) {
   return ret;
 }
 
+template <typename ValType>
+TL_DEVICE half2 AtomicAddx2Ret(half_t *ref, ValType val, int memory_order = 0) {
+  (void)memory_order;
+  half2 add_val = ToHalf2(val);
+  half2 ret;
+  ret.x = atomicAdd(ref + 0, add_val.x);
+  ret.y = atomicAdd(ref + 1, add_val.y);
+  return ret;
+}
+
+template <typename ValType>
+TL_DEVICE __maca_bfloat162 AtomicAddx2Ret(bfloat16_t *ref, ValType val,
+                                          int memory_order = 0) {
+  (void)memory_order;
+  __maca_bfloat162 add_val = *reinterpret_cast<const __maca_bfloat162 *>(val);
+  __maca_bfloat162 ret;
+  ret.x = atomicAdd(ref + 0, add_val.x);
+  ret.y = atomicAdd(ref + 1, add_val.y);
+  return ret;
+}
+
 // Scalar fallback for float AtomicAddx4
 template <typename dst_dtype, typename ValType>
 TL_DEVICE void AtomicAddx4(dst_dtype *ref, ValType val, int memory_order = 0) {
@@ -354,6 +375,32 @@ TL_DEVICE float4 AtomicAddx4Ret(dst_dtype *ref, ValType val,
   ret.y = atomicAdd(ref + 1, add_val.y);
   ret.z = atomicAdd(ref + 2, add_val.z);
   ret.w = atomicAdd(ref + 3, add_val.w);
+  return ret;
+}
+
+// No single-atomic fp16x4 exists, so this is two per-pair AtomicAddx2Ret
+// (per-pair atomic, like the fp32-x4 fallback). Returns uint2 (the half4 store
+// type): the two half2 packed.
+template <typename SrcType>
+TL_DEVICE uint2 AtomicAddx4Ret(half_t *ref, SrcType *val,
+                               int memory_order = 0) {
+  half2 prev_lo = AtomicAddx2Ret(ref, val, memory_order);
+  half2 prev_hi = AtomicAddx2Ret(ref + 2, val + 2, memory_order);
+  uint2 ret;
+  ret.x = *reinterpret_cast<const unsigned int *>(&prev_lo);
+  ret.y = *reinterpret_cast<const unsigned int *>(&prev_hi);
+  return ret;
+}
+
+// bf16 counterpart of the fp16 AtomicAddx4Ret above.
+template <typename SrcType>
+TL_DEVICE uint2 AtomicAddx4Ret(bfloat16_t *ref, SrcType *val,
+                               int memory_order = 0) {
+  __maca_bfloat162 prev_lo = AtomicAddx2Ret(ref, val, memory_order);
+  __maca_bfloat162 prev_hi = AtomicAddx2Ret(ref + 2, val + 2, memory_order);
+  uint2 ret;
+  ret.x = *reinterpret_cast<const unsigned int *>(&prev_lo);
+  ret.y = *reinterpret_cast<const unsigned int *>(&prev_hi);
   return ret;
 }
 

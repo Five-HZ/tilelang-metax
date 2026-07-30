@@ -68,9 +68,9 @@ class TensorCoreIntrinEmitter:
 
     def __init__(
         self,
-        a_dtype: str = T.float16,
-        b_dtype: str = T.float16,
-        accum_dtype: str = T.float16,
+        a_dtype: str = "float16",
+        b_dtype: str = "float16",
+        accum_dtype: str = "float16",
         a_transposed: bool = False,
         b_transposed: bool = False,
         block_row_warps: int = 2,
@@ -119,7 +119,7 @@ class TensorCoreIntrinEmitter:
         xcore_num = int(xcore[len(non_digits_part) :])
         return xcore_num
 
-    def _initialize_k_dim(self, a_dtype=T.float16):
+    def _initialize_k_dim(self, a_dtype="float16"):
         serial = self.get_target_serial()
         if isinstance(a_dtype, str):
             if a_dtype in ["float8_e4m3fn", "float8_e4m3fnuz", "float8_e5m2", "float8_e5m2fnuz"]:
@@ -774,9 +774,9 @@ class TensorCoreIntrinEmitter:
 class TensorCorePreshuffleIntrinEmitter(TensorCoreIntrinEmitter):
     def __init__(
         self,
-        a_dtype: str = T.float16,
-        b_dtype: str = T.float16,
-        accum_dtype: str = T.float16,
+        a_dtype: str = "float16",
+        b_dtype: str = "float16",
+        accum_dtype: str = "float16",
         a_transposed: bool = False,
         b_transposed: bool = False,
         block_row_warps: int = 2,
