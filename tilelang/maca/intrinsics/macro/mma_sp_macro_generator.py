@@ -72,10 +72,10 @@ class SparseTensorCoreIntrinEmitter:
 
     def __init__(
         self,
-        a_dtype: str = T.float16,
-        e_dtype: str = T.uint8,
-        b_dtype: str = T.float16,
-        accum_dtype: str = T.float16,
+        a_dtype: str = "float16",
+        e_dtype: str = "uint8",
+        b_dtype: str = "float16",
+        accum_dtype: str = "float16",
         a_transposed: bool = False,
         b_transposed: bool = False,
         e_transposed: bool = False,
@@ -120,7 +120,7 @@ class SparseTensorCoreIntrinEmitter:
                 f"Invalid threads configuration for this tile shape, {self.warp_rows} x {self.warp_cols} with threads {self.threads}"
             )
 
-    def _initialize_k_dim(self, a_dtype=T.float16):
+    def _initialize_k_dim(self, a_dtype="float16"):
         if isinstance(a_dtype, str):
             if a_dtype in ["float8_e4m3fn", "float8_e4m3fnuz", "float8_e5m2", "float8_e5m2fnuz"]:
                 self.k_dim = 32

@@ -30,6 +30,7 @@
 
 #define TL_DEVICE __forceinline__ __device__
 #define TL_DEVICE_NOINLINE __noinline__ __device__
+#define TL_PATCH
 
 #define TILELANG_CHECK(stmt)                                                   \
   do {                                                                         \
@@ -51,10 +52,9 @@
     }                                                                          \
   } while (0)
 
-#define __float2half_rn(x) half(x)
+using half_t = __half;
 
-#define hpow __ocml_pown_f16
-#define hsqrt __ocml_sqrt_f16
+using bfloat16_t = maca_bfloat16;
 
 struct bfloat16x2 {
   bfloat16_t data[2];
@@ -85,10 +85,6 @@ using float16x16 =
     __attribute__((__vector_size__(16 * sizeof(float16_t)))) float16_t;
 
 using float32x2 = __attribute__((__vector_size__(2 * sizeof(float)))) float;
-
-using half_t = __half;
-
-using bfloat16_t = maca_bfloat16;
 
 typedef
     __attribute__((__vector_size__(4 * sizeof(short)))) short bfloat16x4_vec;
@@ -355,6 +351,53 @@ TL_DEVICE int __dp4a(int srcA, int srcB, int c) {
 
   return v_srca.x * v_srcb.x + v_srca.y * v_srcb.y + v_srca.z * v_srcb.z +
          v_srca.w * v_srcb.w + c;
+}
+
+// Pack eight int values.
+TL_DEVICE longlong4 make_longlong4(int x0, int x1, int y0, int y1, int z0,
+                                   int z1, int w0, int w1) {
+  longlong4 result;
+  *((int2 *)&result.x) = make_int2(x0, x1);
+  *((int2 *)&result.y) = make_int2(y0, y1);
+  *((int2 *)&result.z) = make_int2(z0, z1);
+  *((int2 *)&result.w) = make_int2(w0, w1);
+  return result;
+}
+
+// Pack thirty-two char values.
+TL_DEVICE longlong4
+make_longlong4(signed char x0, signed char x1, signed char x2, signed char x3,
+               signed char x4, signed char x5, signed char x6, signed char x7,
+               signed char y0, signed char y1, signed char y2, signed char y3,
+               signed char y4, signed char y5, signed char y6, signed char y7,
+               signed char z0, signed char z1, signed char z2, signed char z3,
+               signed char z4, signed char z5, signed char z6, signed char z7,
+               signed char w0, signed char w1, signed char w2, signed char w3,
+               signed char w4, signed char w5, signed char w6, signed char w7) {
+  longlong4 result;
+  *((int2 *)&result.x) = make_int2(x0, x1, x2, x3, x4, x5, x6, x7);
+  *((int2 *)&result.y) = make_int2(y0, y1, y2, y3, y4, y5, y6, y7);
+  *((int2 *)&result.z) = make_int2(z0, z1, z2, z3, z4, z5, z6, z7);
+  *((int2 *)&result.w) = make_int2(w0, w1, w2, w3, w4, w5, w6, w7);
+  return result;
+}
+
+// Pack thirty-two unsigned char values.
+TL_DEVICE ulonglong4 make_ulonglong4(
+    unsigned char x0, unsigned char x1, unsigned char x2, unsigned char x3,
+    unsigned char x4, unsigned char x5, unsigned char x6, unsigned char x7,
+    unsigned char y0, unsigned char y1, unsigned char y2, unsigned char y3,
+    unsigned char y4, unsigned char y5, unsigned char y6, unsigned char y7,
+    unsigned char z0, unsigned char z1, unsigned char z2, unsigned char z3,
+    unsigned char z4, unsigned char z5, unsigned char z6, unsigned char z7,
+    unsigned char w0, unsigned char w1, unsigned char w2, unsigned char w3,
+    unsigned char w4, unsigned char w5, unsigned char w6, unsigned char w7) {
+  ulonglong4 result;
+  *((uint2 *)&result.x) = make_uint2(x0, x1, x2, x3, x4, x5, x6, x7);
+  *((uint2 *)&result.y) = make_uint2(y0, y1, y2, y3, y4, y5, y6, y7);
+  *((uint2 *)&result.z) = make_uint2(z0, z1, z2, z3, z4, z5, z6, z7);
+  *((uint2 *)&result.w) = make_uint2(w0, w1, w2, w3, w4, w5, w6, w7);
+  return result;
 }
 
 // Helper to cast SMEM pointer to unsigned
