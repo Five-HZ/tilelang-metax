@@ -46,6 +46,10 @@ template <> TL_DEVICE maca_bfloat16 maca_cast<maca_bfloat16, float>(float val) {
   return __float2bfloat16(val);
 }
 
+template <typename T> TL_DEVICE unsigned short PackBits16(const T &val) {
+  return *reinterpret_cast<const unsigned short *>(&val);
+}
+
 template <typename T1, typename T2>
 TL_DEVICE T1 AtomicAddRet(T1 *address, T2 val,
                           int memory_order = int(std::memory_order_relaxed)) {
@@ -97,9 +101,10 @@ TL_DEVICE void AtomicMax(T1 *address, T2 val, int memory_order = 0) {
     // No native atomicMax for half/bf16 on MACA, use atomicCAS loop
     unsigned short *address_as_ushort =
         reinterpret_cast<unsigned short *>(address);
-    unsigned short val_as_ushort = *reinterpret_cast<unsigned short *>(&val);
+    NT1 val_cast = maca_cast<NT1>(val);
+    unsigned short val_as_ushort = PackBits16(val_cast);
     unsigned short old_val_ushort = *address_as_ushort;
-    while (val > *reinterpret_cast<T1 *>(&old_val_ushort)) {
+    while (val_cast > *reinterpret_cast<NT1 *>(&old_val_ushort)) {
       unsigned short assumed = old_val_ushort;
       old_val_ushort = atomicCAS(address_as_ushort, assumed, val_as_ushort);
       if (assumed == old_val_ushort)
@@ -118,9 +123,10 @@ TL_DEVICE T1 AtomicMaxRet(T1 *address, T2 val, int memory_order = 0) {
                 std::is_same_v<NT1, maca_bfloat16>) {
     unsigned short *address_as_ushort =
         reinterpret_cast<unsigned short *>(address);
-    unsigned short val_as_ushort = *reinterpret_cast<unsigned short *>(&val);
+    NT1 val_cast = maca_cast<NT1>(val);
+    unsigned short val_as_ushort = PackBits16(val_cast);
     unsigned short old_val_ushort = *address_as_ushort;
-    while (val > *reinterpret_cast<T1 *>(&old_val_ushort)) {
+    while (val_cast > *reinterpret_cast<NT1 *>(&old_val_ushort)) {
       unsigned short assumed = old_val_ushort;
       old_val_ushort = atomicCAS(address_as_ushort, assumed, val_as_ushort);
       if (assumed == old_val_ushort)
@@ -141,9 +147,10 @@ TL_DEVICE void AtomicMin(T1 *address, T2 val, int memory_order = 0) {
     // No native atomicMin for half/bf16 on MACA, use atomicCAS loop
     unsigned short *address_as_ushort =
         reinterpret_cast<unsigned short *>(address);
-    unsigned short val_as_ushort = *reinterpret_cast<unsigned short *>(&val);
+    NT1 val_cast = maca_cast<NT1>(val);
+    unsigned short val_as_ushort = PackBits16(val_cast);
     unsigned short old_val_ushort = *address_as_ushort;
-    while (val < *reinterpret_cast<T1 *>(&old_val_ushort)) {
+    while (val_cast < *reinterpret_cast<NT1 *>(&old_val_ushort)) {
       unsigned short assumed = old_val_ushort;
       old_val_ushort = atomicCAS(address_as_ushort, assumed, val_as_ushort);
       if (assumed == old_val_ushort)
@@ -162,9 +169,10 @@ TL_DEVICE T1 AtomicMinRet(T1 *address, T2 val, int memory_order = 0) {
                 std::is_same_v<NT1, maca_bfloat16>) {
     unsigned short *address_as_ushort =
         reinterpret_cast<unsigned short *>(address);
-    unsigned short val_as_ushort = *reinterpret_cast<unsigned short *>(&val);
+    NT1 val_cast = maca_cast<NT1>(val);
+    unsigned short val_as_ushort = PackBits16(val_cast);
     unsigned short old_val_ushort = *address_as_ushort;
-    while (val < *reinterpret_cast<T1 *>(&old_val_ushort)) {
+    while (val_cast < *reinterpret_cast<NT1 *>(&old_val_ushort)) {
       unsigned short assumed = old_val_ushort;
       old_val_ushort = atomicCAS(address_as_ushort, assumed, val_as_ushort);
       if (assumed == old_val_ushort)

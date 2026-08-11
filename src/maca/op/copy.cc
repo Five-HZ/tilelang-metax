@@ -9,6 +9,7 @@
 #include "maca/op/copy.h"
 #include "op/builtin.h"
 #include "op/utils.h"
+#include "span_utils.h"
 #include "transform/common/loop_fusion_utils.h"
 #include "transform/maca_memcpy_async_injector.h"
 
@@ -165,7 +166,8 @@ CopyInst Copy::SelectInst(const CopyNode &op, Target target,
   ctx.analyzer = analyzer;
   ctx.emit_diagnostics = true;
   auto result = SelectCopyInstForLowering(op, ctx);
-  ICHECK(result.supported) << result.reason;
+  ICHECK(result.supported) << result.reason
+                           << SpanHintSuffix({op.dst->span, op.src->span});
   return result.inst;
 }
 

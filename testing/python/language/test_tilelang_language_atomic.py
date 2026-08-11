@@ -3,9 +3,17 @@ import tilelang.testing
 import tilelang.layout
 import tilelang.language as T
 import torch
+from tilelang import tvm
 
 
 # ======================= Thread-level atomic add =======================
+
+
+def _check_hopper():
+    if not torch.cuda.is_available() or torch.version.hip is not None:
+        return False
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return (props.major, props.minor) == (9, 0)
 
 
 @tilelang.jit
@@ -298,6 +306,23 @@ def tma_atomic_add_program(out, explicit_swizzle=False):
             T.atomic_add(out, out_shared, use_tma=True)
 
 
+def tma_atomic_add_compile_program(dtype):
+    @T.prim_func
+    def main(out: T.Tensor((16, 16), dtype)):
+        with T.Kernel(1):
+            out_shared = T.alloc_shared((16, 16), dtype=dtype)
+            T.atomic_add(out, out_shared, use_tma=True)
+
+    return main
+
+
+def lower_tma_atomic_add(dtype):
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_90"})
+    with target:
+        return tilelang.lower(tma_atomic_add_compile_program(dtype), target=target)
+
+
+@pytest.mark.skipif(not _check_hopper(), reason="Requires Hopper GPU (sm_90)")
 @tilelang.testing.skip_on_maca
 @tilelang.testing.requires_cuda
 def test_tma_atomic_add():
@@ -312,6 +337,20 @@ def test_tma_atomic_add():
     kernel_with_explicit_swizzle = tma_atomic_add_program.compile(out=T.Tensor[(16, 16), T.float32], explicit_swizzle=True)
     # Ensure auto swizzled layout is applied
     assert kernel.get_kernel_source() == kernel_with_explicit_swizzle.get_kernel_source()
+
+
+@tilelang.testing.skip_on_maca
+@pytest.mark.parametrize("dtype", [T.int16, T.float64, T.uint64, T.float32x2])
+def test_tma_atomic_add_rejects_unsupported_dtype(dtype):
+    with pytest.raises(Exception, match=rf"TMA atomic add does not support dtype {dtype}.*supported scalar dtypes"):
+        lower_tma_atomic_add(dtype)
+
+
+@tilelang.testing.skip_on_maca
+@pytest.mark.parametrize("dtype", [T.float16, T.bfloat16, T.float32, T.int32, T.uint32])
+def test_tma_atomic_add_accepts_supported_dtype(dtype):
+    artifact = lower_tma_atomic_add(dtype)
+    assert "tma_store_add" in artifact.kernel_source
 
 
 def run_atomic_add_auto_vectorized(K, M, N, block_M, block_N, dtype=T.float32):
@@ -684,6 +723,63 @@ def test_atomic_max():
 
 def test_atomic_min():
     run_atomic_min(4, 64, 64, 16, 16)
+
+
+# ======== fp16/bf16 scalar max/min value-dtype conversion (issue #2758) ========
+
+
+def run_atomic_max_scalar_literal(dtype):
+    @tilelang.jit
+    def wrapper():
+        @T.prim_func
+        def kernel(dst: T.Tensor((1,), dtype)):
+            with T.Kernel(1, threads=1):
+                T.atomic_max(dst[0], 42.0)  # python float literal is fp32
+
+        return kernel
+
+    kernel = wrapper()
+    dst = torch.full((1,), -1e4, device="cuda", dtype=getattr(torch, dtype))
+    kernel(dst)
+    torch.testing.assert_close(dst, torch.full((1,), 42.0, device="cuda", dtype=getattr(torch, dtype)))
+
+
+def run_atomic_min_scalar_literal(dtype):
+    @tilelang.jit
+    def wrapper():
+        @T.prim_func
+        def kernel(dst: T.Tensor((1,), dtype)):
+            with T.Kernel(1, threads=1):
+                T.atomic_min(dst[0], 42.0)  # python float literal is fp32
+
+        return kernel
+
+    kernel = wrapper()
+    dst = torch.full((1,), 1e4, device="cuda", dtype=getattr(torch, dtype))
+    kernel(dst)
+    torch.testing.assert_close(dst, torch.full((1,), 42.0, device="cuda", dtype=getattr(torch, dtype)))
+
+
+@tilelang.testing.requires_cuda
+def test_atomic_max_scalar_fp16():
+    run_atomic_max_scalar_literal("float16")
+
+
+@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version_ge(8, 0)
+def test_atomic_max_scalar_bf16():
+    run_atomic_max_scalar_literal("bfloat16")
+
+
+@tilelang.testing.requires_cuda
+def test_atomic_min_scalar_fp16():
+    run_atomic_min_scalar_literal("float16")
+
+
+@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version_ge(8, 0)
+def test_atomic_min_scalar_bf16():
+    run_atomic_min_scalar_literal("bfloat16")
 
 
 @tilelang.testing.requires_cuda

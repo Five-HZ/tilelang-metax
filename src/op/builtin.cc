@@ -212,6 +212,26 @@ TIR_DEFINE_TL_BUILTIN(tma_store_scatter4)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_BUILTIN(cooperative_tensor_fill)
+    .set_num_inputs(5)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(cooperative_tensor_load)
+    .set_num_inputs(11)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(cooperative_tensor_store)
+    .set_num_inputs(11)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(cooperative_tensor_multiply_accumulate)
+    .set_num_inputs(13)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_BUILTIN(ptx_fence_barrier_init)
     .set_num_inputs(-1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
@@ -249,6 +269,11 @@ TIR_DEFINE_TL_BUILTIN(ptx_wgmma_sp_ss)
 
 TIR_DEFINE_TL_BUILTIN(ptx_wgmma_sp_rs)
     .set_num_inputs(17)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(ptx_mma_block_scale)
+    .set_num_inputs(21)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
