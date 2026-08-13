@@ -1033,7 +1033,7 @@ public:
       return GetRef<Stmt>(op);
     } else {
       return For(op->loop_var, op->min, extent, op->kind, body,
-                 op->thread_binding, op->annotations);
+                 op->thread_binding, op->annotations, op->step, op->span);
     }
   }
 
@@ -1269,7 +1269,8 @@ public:
     Stmt stmt = StmtMutator::VisitStmt_(op);
     op = stmt.as<ForNode>();
     if (op->kind == ForKind::kVectorized) {
-      return For(op->loop_var, op->min, op->extent, ForKind::kSerial, op->body);
+      return For(op->loop_var, op->min, op->extent, ForKind::kSerial, op->body,
+                 op->thread_binding, op->annotations, op->step, op->span);
     } else {
       return stmt;
     }

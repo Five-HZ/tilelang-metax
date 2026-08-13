@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <queue>
 
 #include "../layout/layout.h"
@@ -33,6 +34,7 @@
 #include "common/union_find.h"
 #include "layout_reducer.h"
 #include "parallel_loop_layout_validator.h"
+#include "span_utils.h"
 #include "tir/transforms/ir_utils.h"
 
 namespace tvm {
@@ -127,14 +129,23 @@ public:
            "required for layout inference.";
 
     // Run InferLayout
-    auto updates = next->InferLayout(LayoutInferArgs{target_,
-                                                     thread_bounds,
-                                                     layout_map,
-                                                     cur_analyzer,
-                                                     {},
-                                                     bind_var_to_expr_,
-                                                     false},
-                                     level);
+    LayoutMap updates;
+    try {
+      updates = next->InferLayout(LayoutInferArgs{target_,
+                                                  thread_bounds,
+                                                  layout_map,
+                                                  cur_analyzer,
+                                                  {},
+                                                  bind_var_to_expr_,
+                                                  false},
+                                  level);
+    } catch (const std::bad_optional_access &e) {
+      LOG(FATAL) << "bad_optional_access while inferring layout for op "
+                 << cur_infer_id << " (" << next->GetTypeKey() << ") at level "
+                 << InferLevelToString(level)
+                 << "\nthread_bounds=" << thread_bounds
+                 << "\nstmt=" << infer_list_stmt_[cur_infer_id];
+    }
 
     // Process the returned updates
     for (const auto &[buffer, layout] : updates) {
@@ -252,7 +263,8 @@ public:
           LOG(FATAL) << "Get different layout for " << buffer
                      << "\n current layout: " << layout->DebugOutput()
                      << "\n previous layout: "
-                     << layout_map[buffer]->DebugOutput();
+                     << layout_map[buffer]->DebugOutput()
+                     << SpanHintSuffix(buffer->span);
         }
         // Ensure aliases are consistent too
         propagate_alias(buffer, layout);
@@ -415,7 +427,8 @@ public:
       if (IsFragmentBuffer(buffer)) {
         ICHECK_NE(layout_map.count(buffer), 0)
             << "The layout for fragment " << buffer
-            << " can not be inferred correctly.";
+            << " can not be inferred correctly."
+            << SpanHintSuffix(buffer->span);
       }
     }
 
@@ -524,7 +537,13 @@ private:
     if (op->op.as<GlobalVarNode>())
       return;
 
-    auto p = ParseOperator(GetRef<Call>(op));
+    TileOperator p;
+    try {
+      p = ParseOperator(GetRef<Call>(op));
+    } catch (const std::bad_optional_access &e) {
+      LOG(FATAL) << "bad_optional_access while parsing tile op call: "
+                 << GetRef<Call>(op);
+    }
     if (p.defined()) {
       for (const auto &arg : op->args) {
         if (auto buffer = getBufferFromAccessPtr(arg)) {
@@ -1123,7 +1142,8 @@ private:
                        "buffer. Non-constant shape expr is: "
                     << i
                     << ". This is possibly because you use symbolic shape when "
-                       "accessing a fragment/local buffer.";
+                       "accessing a fragment/local buffer."
+                    << SpanHintSuffix(buffer->span);
                 frag_reg_num *= *pci;
               }
               reg_num += frag_reg_num;

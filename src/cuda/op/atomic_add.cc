@@ -14,6 +14,7 @@
 #include "layout/layout.h"
 #include "op/builtin.h"
 #include "op/utils.h"
+#include "span_utils.h"
 #include "transform/common/loop_fusion_utils.h"
 #include "transform/loop_partition.h"
 
@@ -219,7 +220,8 @@ LayoutMap InferSIMTLayout(const AtomicAddNode &op,
           << "AtomicAdd requires src and dst to have the same layout, but got "
           << "src layout: " << src_layout << ", dst layout: " << dst_layout
           << " for src buffer: " << op.src->name
-          << ", dst buffer: " << op.dst->name;
+          << ", dst buffer: " << op.dst->name
+          << SpanHintSuffix({op.dst->span, op.src->span});
     }
   }
   return {};
@@ -310,6 +312,20 @@ struct AtomicAdd {
         << "AtomicAdd between buffer " << shared_tensor->name << " and "
         << global_tensor->name << " with different data type "
         << shared_tensor->dtype << " and " << global_tensor->dtype;
+
+    DataType dtype = global_tensor->dtype;
+    // uint64 is legal in PTX, but its inferred 64-bit K-inner shared layout is
+    // not currently representable by the TensorMap swizzle selected below.
+    bool supports_tma_reduce_add =
+        dtype.is_scalar() &&
+        (dtype.is_bfloat16() ||
+         (dtype.is_float() && (dtype.bits() == 16 || dtype.bits() == 32)) ||
+         (dtype.is_int() && dtype.bits() == 32) ||
+         (dtype.is_uint() && dtype.bits() == 32));
+    ICHECK(supports_tma_reduce_add)
+        << "TMA atomic add does not support dtype " << dtype
+        << "; supported scalar dtypes are float16, bfloat16, float32, int32, "
+           "and uint32";
 
     desc.data_type = to_CUtensorMapDataType(global_tensor->dtype);
     desc.global_addr = global_tensor->data;
