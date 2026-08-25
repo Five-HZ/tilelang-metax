@@ -1,3 +1,5 @@
+import re
+
 from tilelang import tvm as tvm
 from tilelang.backend.target import determine_target
 import tilelang as tl
@@ -7,6 +9,11 @@ import pytest
 import torch
 
 auto_target = tvm.target.Target(determine_target("auto"))
+
+
+def _assert_launch_bounds(kernel_source: str, threads: int) -> None:
+    # CUDA emits `__launch_bounds__(N, 1)` while HIP emits `__launch_bounds__(N)`.
+    assert re.search(rf"__launch_bounds__\({threads}\b", kernel_source)
 
 
 @pytest.mark.parametrize(
@@ -103,6 +110,36 @@ def test_loop_tail_split(block_M, block_N, block_K, threads, vec_load_b, dtype):
         # tvm.ir.assert_structural_equal(mod, ref_mod)
 
 
+def test_register_count_is_default_layout_cost_model():
+    @T.prim_func
+    def main(
+        S: T.Tensor((2,), T.float32),
+        Out: T.Tensor((2, 2560), T.float32),
+    ):
+        with T.Kernel(1, threads=256):
+            s_frag = T.alloc_fragment((2,), T.float32)
+            for i in T.Parallel(2):
+                s_frag[i] = S[i]
+            for i, j in T.Parallel(2, 2560):
+                Out[i, j] = s_frag[i] * 2.0
+
+    target = auto_target
+
+    def infer(pass_configs=None):
+        with target, tvm.transform.PassContext(config=pass_configs or {}):
+            mod = tvm.IRModule({"main": main})
+            mod = tvm.tirx.transform.BindTarget(target)(mod)
+            mod = tl.transform.MaterializeKernelLaunch()(mod)
+            return tl.transform.LayoutInference()(mod)
+
+    default = infer()
+    register_count = infer({"tl.layout_cost_model": "register-count"})
+    io_aware = infer({"tl.layout_cost_model": "io-aware"})
+
+    tvm.ir.assert_structural_equal(default, register_count)
+    assert not tvm.ir.structural_equal(default, io_aware)
+
+
 def test_static_ragged_copy_minimizes_full_thread_padding():
     n = 514
     threads = 128
@@ -119,7 +156,7 @@ def test_static_ragged_copy_minimizes_full_thread_padding():
         artifact = tl.lower(main, target=auto_target, enable_device_compile=False)
 
     kernel_source = str(artifact.kernel_source)
-    assert "__launch_bounds__(128, 1)" in kernel_source
+    _assert_launch_bounds(kernel_source, 128)
     assert "for (int i = 0; i < 5; ++i)" in kernel_source
     assert "threadIdx.x) >> 1)) < 257" in kernel_source
     assert "float2" not in kernel_source
@@ -142,7 +179,7 @@ def test_static_ragged_fp8_copy_minimizes_full_thread_padding():
         artifact = tl.lower(main, target=auto_target, enable_device_compile=False)
 
     kernel_source = str(artifact.kernel_source)
-    assert "__launch_bounds__(128, 1)" in kernel_source
+    _assert_launch_bounds(kernel_source, 128)
     assert "for (int i = 0; i < 3; ++i)" in kernel_source
     assert "fp8_e4_8_t" in kernel_source
     assert "fp8_e4_16_t" not in kernel_source
@@ -164,7 +201,7 @@ def test_static_ragged_copy_allows_1024_elements_384_threads():
         artifact = tl.lower(main, target=auto_target, enable_device_compile=False)
 
     kernel_source = str(artifact.kernel_source)
-    assert "__launch_bounds__(384, 1)" in kernel_source
+    _assert_launch_bounds(kernel_source, 384)
     assert "for (int i = 0; i < 3; ++i)" in kernel_source
     assert "B[((i * 384) + ((int)threadIdx.x))]" in kernel_source
     assert "(((int)threadIdx.x) >> 7)) < 8" in kernel_source

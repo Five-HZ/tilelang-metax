@@ -66,9 +66,9 @@ For PragmaUnrollLoop(For stmt);
  * \param parallel_loop Whether this is a true parallel loop requiring thread
  *        partitioning. False for loops that only operate on local/register
  *        buffers. (default true)
- * \param should_vectorize Whether to vectorize the loop. False when reducers
- *        are present or when there are no non-local buffer accesses.
- *        (default true)
+ * \param should_vectorize Whether to vectorize the loop. False when reducer
+ *        combine stores (execution-multiplicity markers) are present or when
+ *        there are no non-local buffer accesses. (default true)
  * \return The lowered statement.
  */
 Stmt LowerParallelLoop(

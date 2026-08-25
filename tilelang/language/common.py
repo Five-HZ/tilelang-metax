@@ -79,6 +79,8 @@ from .reduce_op import (
     reduce_bitand,  # noqa: F401
     reduce_bitor,  # noqa: F401
     reduce_bitxor,  # noqa: F401
+    reducer_init,  # noqa: F401
+    reducer_update,  # noqa: F401
     finalize_reducer,  # noqa: F401
     warp_reduce_sum,  # noqa: F401
     warp_reduce_max,  # noqa: F401
@@ -137,10 +139,24 @@ from .utils import index_to_coordinates  # noqa: F401
 
 from .symbolics import dynamic, symbolic  # noqa: F401
 from .annotations import (  # noqa: F401
+    WSID,
     use_swizzle,
     annotate_layout,
     annotate_safe_value,
     annotate_restrict_buffers,
+    annotate_ws_schedule,
+    ws_op,
+)
+
+from .ws_schedule import (  # noqa: F401
+    WSRole,
+    WSPipeline,
+    WSInstr,
+    WSOpRef,
+    WSSync,
+    WSSyncKind,
+    WSScope,
+    WSSchedule,
 )
 
 from .meta import (
@@ -187,6 +203,15 @@ _LOCAL_EXPORTS = (
     "Tensor",
     "Unroll",
     "Vectorized",
+    "WSID",
+    "WSInstr",
+    "WSOpRef",
+    "WSPipeline",
+    "WSRole",
+    "WSSchedule",
+    "WSScope",
+    "WSSync",
+    "WSSyncKind",
     "access_ptr",
     "activemask",
     "all_of",
@@ -202,6 +227,8 @@ _LOCAL_EXPORTS = (
     "annotate_layout",
     "annotate_restrict_buffers",
     "annotate_safe_value",
+    "annotate_ws_schedule",
+    "ws_op",
     "any_of",
     "any_sync",
     "async_copy",
@@ -226,6 +253,8 @@ _LOCAL_EXPORTS = (
     "dynamic",
     "empty",
     "fill",
+    "reducer_init",
+    "reducer_update",
     "finalize_reducer",
     "gemm",
     "gemm_sp",

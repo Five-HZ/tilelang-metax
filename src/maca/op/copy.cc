@@ -5,13 +5,13 @@
 
 #include "op/copy.h"
 
+#include "../transform/maca_memcpy_async_injector.h"
 #include "backend/common/target_utils.h"
 #include "maca/op/copy.h"
 #include "op/builtin.h"
 #include "op/utils.h"
 #include "span_utils.h"
 #include "transform/common/loop_fusion_utils.h"
-#include "transform/maca_memcpy_async_injector.h"
 
 #include <tvm/tirx/analysis.h>
 #include <tvm/tirx/builtin.h>

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from tvm.target import Target
 
-from tilelang.backend.execution_backend import ExecutionBackendSpec, register_execution_backend
+from tilelang.backend.execution_backend import ExecutionBackendSpec
 
 
 def _is_cutedsl_target(target: Target) -> bool:
@@ -31,28 +31,9 @@ def _is_cutedsl_available() -> bool:
     return True
 
 
-register_execution_backend(
-    "maca",
-    ExecutionBackendSpec(
-        "tvm_ffi",
-        supports_target=_is_plain_maca_target,
-        enable_host_codegen=True,
-        enable_device_compile=True,
-    ),
-    override=True,
-)
-register_execution_backend(
-    "maca",
+MACA_EXECUTION_BACKENDS = [
+    ExecutionBackendSpec("tvm_ffi", supports_target=_is_plain_maca_target, enable_host_codegen=True, enable_device_compile=True),
     ExecutionBackendSpec("mcrtc", is_available=_is_mcrtc_available, supports_target=_is_plain_maca_target),
-    override=True,
-)
-register_execution_backend(
-    "maca",
     ExecutionBackendSpec("cython", supports_target=_is_plain_maca_target),
-    override=True,
-)
-register_execution_backend(
-    "maca",
     ExecutionBackendSpec("cutedsl", is_available=_is_cutedsl_available, supports_target=_is_cutedsl_target),
-    override=True,
-)
+]

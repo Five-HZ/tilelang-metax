@@ -489,6 +489,7 @@ def test_fp4_unpacksmem_tma_descriptor_uses_align16b():
 
 
 @tilelang.testing.skip_on_maca
+@tilelang.testing.requires_cuda
 def test_fp4_unpacksmem_tma_store_is_rejected():
     program = fp4_tma_copy_unpacked_smem_store()
     with pytest.raises(tvm.TVMError, match="only supports float4_e2m1_unpacked as an FP4 unpack load"):
@@ -500,6 +501,7 @@ def test_fp4_unpacksmem_tma_store_is_rejected():
 
 
 @tilelang.testing.skip_on_maca
+@tilelang.testing.requires_cuda
 def test_copy_prefer_tma_lowers_as_synchronous_tma_load():
     @T.prim_func
     def main(x: T.Tensor((128, 32), T.float32)):
@@ -523,6 +525,7 @@ def test_copy_prefer_tma_lowers_as_synchronous_tma_load():
 
 
 @tilelang.testing.skip_on_maca
+@tilelang.testing.requires_cuda
 def test_device_bound_pointer_keeps_descriptorless_bulk1d():
     @T.prim_func
     def main(
@@ -549,6 +552,7 @@ def test_device_bound_pointer_keeps_descriptorless_bulk1d():
 
 
 @tilelang.testing.skip_on_maca
+@tilelang.testing.requires_cuda
 def test_device_bound_descriptor_tma_is_rejected_when_ws_disabled():
     @T.prim_func
     def main(src_ptrs: T.Tensor((1,), T.ptr)):
@@ -618,6 +622,49 @@ def test_tma_copy_store_pipeline_2_stages():
 @tilelang.testing.requires_cuda_compute_version_ge(9, 0)
 def test_tma_copy_store_pipeline_3_stages():
     run_gemm_tma_copy_store(num_stages=3)
+
+
+def cluster_multicast_tma_copy_kernel(iters, slots, tile=64):
+    @T.prim_func
+    def main(
+        A: T.Tensor((iters, tile, tile), T.float32),
+        B: T.Tensor((2, iters, tile, tile), T.float32),
+    ):
+        with T.ClusterKernel(2, threads=128, cluster_dims=(2, 1, 1)) as pid:
+            a_shared = T.alloc_shared((slots, tile, tile), dtype=T.float32)
+            mbars = T.alloc_barrier([128] * slots)
+            for k in T.serial(iters):
+                slot = k % slots
+                parity = (k // slots) % 2
+                T.tma_copy(A[k, :, :], a_shared[slot, :, :], barrier=mbars[slot], cluster_mask=0b11)
+                T.mbarrier_arrive(mbarrier=mbars[slot])
+                T.mbarrier_wait_parity(mbarrier=mbars[slot], parity=parity)
+                # Plain T.copy already emits tma_store + arrive + wait.
+                T.copy(a_shared[slot, :, :], B[pid, k, :, :])
+
+    return main
+
+
+@tilelang.testing.requires_cuda_compute_version_ge(9, 0)
+def test_tma_copy_cluster_mask_multicast():
+    """cluster_mask multicasts while keeping tma_copy's split-phase contract.
+
+    The barrier ring is cycled more times than it has slots, so every slot is
+    reused under both parities. A fused wait, or a wait using the wrong parity,
+    would deadlock or return stale data here.
+    """
+    import torch
+
+    iters, slots = 8, 4
+    kernel = tilelang.compile(cluster_multicast_tma_copy_kernel(iters, slots), out_idx=[1])
+    assert "tma_load_multicast" in kernel.get_kernel_source()
+
+    torch.manual_seed(0)
+    A = torch.randn(iters, 64, 64, device="cuda", dtype=torch.float32)
+    B = kernel(A)
+    # Both CTAs of the cluster are in the mask, so both receive every tile.
+    for rank in range(2):
+        torch.testing.assert_close(B[rank], A)
 
 
 if __name__ == "__main__":

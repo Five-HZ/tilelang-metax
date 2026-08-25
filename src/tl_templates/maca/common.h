@@ -8,6 +8,7 @@
 #include <common/maca_fp16.h>
 #include <cstdio>
 #include <limits>
+#include <maca_fp8.h>
 #include <mcr/mc_runtime.h>
 
 #define MACART_INF_F __int_as_float(0x7f800000)
@@ -94,6 +95,254 @@ using float32x4 = __attribute__((__vector_size__(4 * sizeof(float)))) float;
 using float32x16 = __attribute__((__vector_size__(16 * sizeof(float)))) float;
 using float64x4 = __attribute__((__vector_size__(4 * sizeof(double)))) double;
 using int8x4 = __attribute__((__vector_size__(4 * sizeof(int8_t)))) int8_t;
+
+namespace tl {
+TL_DEVICE half_t __cvt_fp8_e4m3_to_half(__maca_fp8_e4m3 x) {
+  unsigned char bits = x.__x;
+  uint16_t sign = (bits & 0x80) ? 0x8000U : 0U;
+  uint16_t exp4 = (bits >> 3) & 0x0FU;
+  uint16_t man3 = bits & 0x07U;
+
+  // NaN: E4M3FN encodes NaN as 0x7F (exp=15, mant=7)
+  if ((bits & 0x7F) == 0x7F) {
+    uint16_t nan_bits = 0x7FFFU;
+    return *reinterpret_cast<half_t *>(&nan_bits);
+  }
+
+  uint16_t fp16_bits;
+
+  if (exp4 == 0) {
+    // Zero or denormal E4M3
+    if (man3 == 0) {
+      fp16_bits = sign; // Zero
+    } else {
+      // E4M3 denormal: value = man3 * 2^-9
+      // Convert to FP16: man3 * 64 = 2^exp16 * (1 + man16/1024)
+      uint16_t scale = man3 << 6;
+
+      int msb_pos = 0;
+      uint16_t temp = scale;
+      while (temp > 1) {
+        temp >>= 1;
+        msb_pos++;
+      }
+
+      uint16_t fp16_exp = msb_pos;
+      uint16_t fp16_man = ((scale - (1U << msb_pos)) * 1024) >> msb_pos;
+      fp16_bits = sign | (fp16_exp << 10) | (fp16_man & 0x03FF);
+    }
+  } else {
+    // Normal E4M3: exp16 = exp4 + 8, man16 = man3 << 7
+    uint16_t fp16_exp = exp4 + 8;
+    uint16_t fp16_man = man3 << 7;
+
+    if (fp16_exp >= 31) {
+      fp16_bits = sign | 0x7C00U; // FP16 infinity
+    } else {
+      fp16_bits = sign | (fp16_exp << 10) | fp16_man;
+    }
+  }
+
+  return *reinterpret_cast<half_t *>(&fp16_bits);
+}
+
+TL_DEVICE float __cvt_fp8_e4m3_to_float(__maca_fp8_e4m3 x) {
+  uint32_t bits;
+  uint32_t sign = ((uint32_t)x.__x & 0x80U) << 24;
+  uint32_t exp4 = ((uint32_t)x.__x >> 3) & 0x0FU;
+  uint32_t man3 = (uint32_t)x.__x & 0x07U;
+
+  if (exp4 == 0U) {
+    /* ±0 or subnormal: value = (-1)^s * man3 * 2^-9 */
+    if (man3 == 0U) {
+      bits = sign; /* ±0 */
+    } else {
+      switch (man3) {
+      case 1U:                      /* 1 * 2^-9  */
+        bits = sign | (118U << 23); /* 1.0 * 2^-9 */
+        break;
+      case 2U:                      /* 2 * 2^-9  */
+        bits = sign | (119U << 23); /* 1.0 * 2^-8 */
+        break;
+      case 3U:                                  /* 3 * 2^-9  */
+        bits = sign | (119U << 23) | 0x400000U; /* 1.5 * 2^-8 */
+        break;
+      case 4U:                      /* 4 * 2^-9  */
+        bits = sign | (120U << 23); /* 1.0 * 2^-7 */
+        break;
+      case 5U:                                  /* 5 * 2^-9  */
+        bits = sign | (120U << 23) | 0x200000U; /* 1.25 * 2^-7 */
+        break;
+      case 6U:                                  /* 6 * 2^-9  */
+        bits = sign | (120U << 23) | 0x400000U; /* 1.5 * 2^-7 */
+        break;
+      case 7U:                                  /* 7 * 2^-9  */
+        bits = sign | (120U << 23) | 0x600000U; /* 1.75 * 2^-7 */
+        break;
+      default:
+        bits = sign;
+        break;
+      }
+    }
+  } else if (exp4 == 15U) {
+    if (man3 == 7U) {
+      /* quiet NaN */
+      bits = sign | 0x7FC00000U;
+    } else {
+      /* normal decode: value = (-1)^s * (1 + man3/8) * 2^(exp4-7)
+      float32: exp32 = (exp4-7)+127 = exp4+120, mant32 = man3 << 20 */
+      bits = sign | ((exp4 + 120U) << 23) | (man3 << 20);
+    }
+  } else {
+    /* 1 <= exp4 <= 14：normal decode */
+    bits = sign | ((exp4 + 120U) << 23) | (man3 << 20);
+  }
+
+  return *reinterpret_cast<float *>(&bits);
+}
+
+TL_DEVICE half_t __cvt_fp8_e5m2_to_half(__maca_fp8_e5m2 x) {
+  uint16_t bits = (uint16_t)x.__x;
+  bits = (uint16_t)(bits << 8U);
+
+  // FP8 e5m2 -> FP16 half bits
+  uint16_t sign = bits & 0x8000U;     // bit15
+  uint16_t exponent = bits & 0x7C00U; // bits14..10 (5-bit exp)
+  uint16_t mantissa = bits & 0x0300U; // bits9..8 (2-bit mantissa)
+
+  if ((exponent == 0x7C00U) && (mantissa != 0)) {
+    mantissa |= 0x0200U; // quiet bit: half mantissa bit9
+  }
+
+  bits = (sign | exponent) | mantissa;
+
+  return *reinterpret_cast<half_t *>(&bits);
+}
+
+TL_DEVICE float __cvt_fp8_e5m2_to_float(__maca_fp8_e5m2 x) {
+  uint32_t bits;
+  uint32_t sign = ((uint32_t)x.__x & 0x80U) << 24;
+  uint32_t exp8 = ((uint32_t)x.__x >> 2) & 0x1FU;
+  uint32_t man8 = (uint32_t)x.__x & 0x03U;
+
+  if (exp8 == 0U) {
+    if (man8 == 0U) {
+      bits = sign;
+    } else {
+      uint32_t exp32, man32;
+      switch (man8) {
+      case 1U:              /* 1 * 2^-16 */
+        exp32 = 127U - 16U; /* 111 */
+        man32 = 0U;
+        break;
+      case 2U:              /* 2 * 2^-16 = 2^-15 */
+        exp32 = 127U - 15U; /* 112 */
+        man32 = 0U;
+        break;
+      case 3U:              /* 3 * 2^-16 = 1.5 * 2^-15 */
+        exp32 = 127U - 15U; /* 112 */
+        man32 = 0x400000U;
+        break;
+      default:
+        exp32 = 0U;
+        man32 = 0U;
+        break;
+      }
+      bits = sign | (exp32 << 23) | man32;
+    }
+  } else if (exp8 == 31U) {
+    if (man8 == 0U) {
+      bits = sign | 0x7F800000U; /* ±Inf */
+    } else {
+      bits = sign | 0x7F800000U | (man8 << 21);
+    }
+  } else {
+    uint32_t exp32 = exp8 + 112U;
+    uint32_t man32 = man8 << 21U;
+    bits = sign | (exp32 << 23) | man32;
+  }
+
+  return *reinterpret_cast<float *>(&bits);
+}
+
+struct fp8_e4_t {
+  using value_t = __maca_fp8_e4m3;
+  value_t v;
+
+  TL_DEVICE constexpr fp8_e4_t() : v{} {}
+
+  TL_DEVICE explicit fp8_e4_t(value_t x) : v(x) {}
+
+  template <class T,
+            std::enable_if_t<!std::is_same_v<std::decay_t<T>, fp8_e4_t> &&
+                                 std::is_constructible_v<value_t, T>,
+                             int> = 0>
+  TL_DEVICE explicit fp8_e4_t(T &&x) : v(std::forward<T>(x)) {}
+
+  TL_DEVICE operator half_t() const { return __cvt_fp8_e4m3_to_half(v); }
+
+  TL_DEVICE operator float() const { return __cvt_fp8_e4m3_to_float(v); }
+
+private:
+  template <class To, class = void>
+  struct is_static_castable : std::false_type {};
+  template <class To>
+  struct is_static_castable<
+      To, std::void_t<decltype(static_cast<To>(std::declval<value_t>()))>>
+      : std::true_type {};
+
+public:
+  template <class To,
+            std::enable_if_t<!std::is_same_v<std::decay_t<To>, half_t> &&
+                                 !std::is_same_v<std::decay_t<To>, float> &&
+                                 !std::is_same_v<std::decay_t<To>, value_t> &&
+                                 !std::is_same_v<std::decay_t<To>, fp8_e4_t> &&
+                                 is_static_castable<To>::value,
+                             int> = 0>
+  TL_DEVICE operator To() const {
+    return static_cast<To>(v);
+  }
+};
+
+struct fp8_e5_t {
+  using value_t = __maca_fp8_e5m2;
+  value_t v;
+
+  TL_DEVICE constexpr fp8_e5_t() : v{} {}
+
+  TL_DEVICE explicit fp8_e5_t(value_t x) : v(x) {}
+
+  template <class T,
+            std::enable_if_t<!std::is_same_v<std::decay_t<T>, fp8_e5_t> &&
+                                 std::is_constructible_v<value_t, T>,
+                             int> = 0>
+  TL_DEVICE explicit fp8_e5_t(T &&x) : v(std::forward<T>(x)) {}
+
+  TL_DEVICE operator half_t() const { return __cvt_fp8_e5m2_to_half(v); }
+
+  TL_DEVICE operator float() const { return __cvt_fp8_e5m2_to_float(v); }
+
+private:
+  template <class To, class = void>
+  struct is_static_castable : std::false_type {};
+  template <class To>
+  struct is_static_castable<
+      To, std::void_t<decltype(static_cast<To>(std::declval<value_t>()))>>
+      : std::true_type {};
+
+public:
+  template <class To,
+            std::enable_if_t<!std::is_same_v<std::decay_t<To>, half_t> &&
+                                 !std::is_same_v<std::decay_t<To>, float> &&
+                                 !std::is_same_v<std::decay_t<To>, value_t> &&
+                                 !std::is_same_v<std::decay_t<To>, fp8_e5_t> &&
+                                 is_static_castable<To>::value,
+                             int> = 0>
+  TL_DEVICE operator To() const {
+    return static_cast<To>(v);
+  }
+};
+} // namespace tl
 
 namespace platform {
 
@@ -307,6 +556,17 @@ TL_DEVICE uint4 make_uint4(unsigned char x0, unsigned char x1, unsigned char x2,
   result.z = make_uint(z0, z1, z2, z3);
   result.w = make_uint(w0, w1, w2, w3);
   return result;
+}
+
+// MACA has no half-precision tangent intrinsic, but tangent lowering uses the
+// half-style `htan` name for 16-bit inputs. Evaluate in float32 and convert the
+// result back to the source type.
+TL_PATCH TL_DEVICE half_t htan(const half_t x) {
+  return half_t(tanf(float(x)));
+}
+
+TL_PATCH TL_DEVICE bfloat16_t htan(const bfloat16_t x) {
+  return bfloat16_t(tanf(float(x)));
 }
 
 // Pack two half_t values.
@@ -655,7 +915,31 @@ TL_DEVICE maca_bfloat162 fma2(maca_bfloat162 a, maca_bfloat162 b,
   return __hfma2(a, b, c);
 }
 
+template <typename T> TL_DEVICE T fast_max(T a, T b) { return a < b ? b : a; }
+
+template <> TL_DEVICE float fast_max(float a, float b) { return fmaxf(a, b); }
+
+template <typename T> TL_DEVICE T fast_min(T a, T b) { return b < a ? b : a; }
+
+template <> TL_DEVICE float fast_min(float a, float b) { return fminf(a, b); }
+
 TL_DEVICE half2 fma2(half2 a, half2 b, half2 c) { return __hfma2(a, b, c); }
+
+TL_DEVICE fp8_e4_t max(fp8_e4_t lhs, fp8_e4_t rhs) {
+  return fp8_e4_t(fmaxf(static_cast<float>(lhs), static_cast<float>(rhs)));
+}
+
+TL_DEVICE fp8_e4_t min(fp8_e4_t lhs, fp8_e4_t rhs) {
+  return fp8_e4_t(fminf(static_cast<float>(lhs), static_cast<float>(rhs)));
+}
+
+TL_DEVICE fp8_e5_t max(fp8_e5_t lhs, fp8_e5_t rhs) {
+  return fp8_e5_t(fmaxf(static_cast<float>(lhs), static_cast<float>(rhs)));
+}
+
+TL_DEVICE fp8_e5_t min(fp8_e5_t lhs, fp8_e5_t rhs) {
+  return fp8_e5_t(fminf(static_cast<float>(lhs), static_cast<float>(rhs)));
+}
 
 // --- max2 ----------------------------------------------------------------
 
@@ -704,6 +988,25 @@ TL_DEVICE float2 abs2(float2 a) { return make_float2(fabsf(a.x), fabsf(a.y)); }
 TL_DEVICE maca_bfloat162 abs2(maca_bfloat162 a) { return __habs2(a); }
 
 TL_DEVICE half2 abs2(half2 a) { return __habs2(a); }
+
+TL_DEVICE half_t RoundTiesAwayFromZero(half_t x) {
+  return half_t(roundf(float(x)));
+}
+TL_DEVICE float RoundTiesAwayFromZero(float x) { return roundf(x); }
+
+TL_DEVICE double RoundTiesAwayFromZero(double x) { return round(x); }
+
+TL_DEVICE bfloat16_t RoundTiesAwayFromZero(bfloat16_t x) {
+  return bfloat16_t(roundf(float(x)));
+}
+
+TL_DEVICE fp8_e4_t RoundTiesAwayFromZero(fp8_e4_t x) {
+  return fp8_e4_t((roundf(float(x))));
+}
+
+TL_DEVICE fp8_e5_t RoundTiesAwayFromZero(fp8_e5_t x) {
+  return fp8_e5_t((roundf(float(x))));
+}
 
 } // namespace tl
 

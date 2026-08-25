@@ -483,7 +483,7 @@ class TensorCoreIntrinEmitter:
         @T.macro
         def _atom_mma(A_local_buf, B_local_buf, C_local_buf):
             for kp in T.grid(k_pack):
-                T.tvm_mfma(
+                T.maca_mma(
                     mma_suffix,
                     "row",
                     "row",

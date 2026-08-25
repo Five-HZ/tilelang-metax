@@ -115,6 +115,7 @@ def test_jit_phase_is_silent_when_disabled(caplog, capture_tilelang_logs):
     assert not caplog.records
 
 
+@tilelang.testing.skip_on_maca
 def test_nvcc_compile_cuda_honors_tilelang_timeout(monkeypatch):
     from tilelang.contrib import nvcc
 
@@ -160,6 +161,7 @@ def test_nvcc_target_code_list_parser():
         get_target_code_list(["compute_100f"])
 
 
+@tilelang.testing.skip_on_maca
 def test_nvcc_compile_cuda_honors_target_code(monkeypatch):
     from tilelang.backend.target import determine_target
     from tilelang.contrib import nvcc
@@ -185,12 +187,10 @@ def test_nvcc_compile_cuda_honors_target_code(monkeypatch):
     assert captured["cmd"][gencode_index + 1] == "arch=compute_100f,code=[sm_100a,sm_103a]"
 
 
+@tilelang.testing.skip_on_maca
 def test_cuda_compile_callback_uses_fatbin_for_multiple_target_code(monkeypatch):
-    import importlib
-
     from tilelang.backend.target import determine_target
-
-    lower = importlib.import_module("tilelang.engine.lower")
+    from tilelang.cuda import backend as cuda_backend
 
     captured = {}
 
@@ -199,10 +199,10 @@ def test_cuda_compile_callback_uses_fatbin_for_multiple_target_code(monkeypatch)
         captured["arch"] = arch
         return bytearray(b"fake-cuda-binary")
 
-    monkeypatch.setattr(lower.nvcc, "compile_cuda", fake_compile_cuda)
+    monkeypatch.setattr(cuda_backend.nvcc, "compile_cuda", fake_compile_cuda)
 
     target = determine_target({"kind": "cuda", "arch": "sm_100f", "code": ["sm_100a", "sm_103a"]}, return_object=True)
-    lower.tilelang_callback_cuda_compile("__global__ void kernel() {}", target)
+    cuda_backend.tilelang_callback_cuda_compile("__global__ void kernel() {}", target)
 
     assert captured["target_format"] == "fatbin"
     assert captured["arch"] == ["-gencode", "arch=compute_100f,code=[sm_100a,sm_103a]"]
@@ -267,17 +267,15 @@ def test_compile_timeout_env_parser_accepts_empty_zero_and_positive(monkeypatch)
         _get_compile_timeout_seconds()
 
 
+@tilelang.testing.skip_on_maca
 def test_kernel_cache_miss_compile_logs_context(monkeypatch, tmp_path, caplog, capture_tilelang_logs):
     import tilelang.cache.kernel_cache as kernel_cache_mod
     from tilelang.cache.kernel_cache import KernelCache
     from tilelang.env import env
 
     cache_dir = tmp_path / "cache"
-    tmp_dir = tmp_path / "tmp"
     cache_dir.mkdir()
-    tmp_dir.mkdir()
     monkeypatch.setattr(env, "TILELANG_CACHE_DIR", str(cache_dir))
-    monkeypatch.setattr(env, "TILELANG_TMP_DIR", str(tmp_dir))
     monkeypatch.setenv("TILELANG_JIT_DIAGNOSTICS", "1")
 
     class _FakeKernel:
@@ -296,7 +294,7 @@ def test_kernel_cache_miss_compile_logs_context(monkeypatch, tmp_path, caplog, c
         cache.cached(
             _ScriptableFunc(),
             out_idx=[],
-            target="cuda -arch=sm_120",
+            target={"kind": "cuda", "arch": "sm_120"},
             target_host=None,
             execution_backend="tvm_ffi",
             verbose=False,
