@@ -392,7 +392,7 @@ class SparseTensorCoreIntrinEmitter:
         @T.macro
         def _warp_mma(A_local_buf, B_local_buf, C_local_buf):
             for kp, i, j in T.grid(k_pack, warp_rows, warp_cols):
-                T.tvm_mfma(
+                T.maca_mma(
                     mma_suffix,
                     "row",
                     "row",

@@ -15,12 +15,12 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include "target/source/codegen_c.h"
+#include "backend/common/codegen/codegen_c_line_directives.h"
 
 namespace tvm {
 namespace codegen {
 
-class CodeGenTileLangCUDA final : public CodeGenC {
+class CodeGenTileLangCUDA final : public CodeGenCWithLineDirectives {
 public:
   CodeGenTileLangCUDA();
   std::string Finish();
@@ -62,6 +62,7 @@ public:
   void VisitStmt_(const AttrStmtNode *op) final;
   void VisitExpr_(const BufferLoadNode *op, std::ostream &os) final;
   void VisitStmt_(const BufferStoreNode *op) final;
+  void VisitExpr_(const SelectNode *op, std::ostream &os) final;
 
   // Override this as a work around for __grid_constant__ parameter
   void AddFunction(const GlobalVar &gvar, const PrimFunc &f);

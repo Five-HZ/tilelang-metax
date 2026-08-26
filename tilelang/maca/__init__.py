@@ -9,3 +9,4 @@ from . import transform  # noqa: F401
 from . import language as language  # noqa: F401
 from . import intrinsics as intrinsics  # noqa: F401
 from . import op as op  # noqa: F401
+from . import backend as backend  # noqa: F401

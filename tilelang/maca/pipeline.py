@@ -4,7 +4,7 @@ from tvm import IRModule, s_tir, tirx
 from tvm.target import Target
 
 import tilelang
-from tilelang.backend.pass_pipeline.pipeline import PassPipeline, register_pipeline
+from tilelang.backend.pass_pipeline import PassPipeline
 from tilelang.backend.pass_pipeline.pipeline_utils import (
     LayoutVisual,
     allow_vectorize,
@@ -33,12 +33,27 @@ def MACAPassPipelineBodyPrologue(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.InjectAssumes()(mod)
     # Simplify the IR expressions
     mod = tilelang.transform.Simplify()(mod)
-    # Set layouts for reducers
-    mod = tilelang.transform.LayoutReducer()(mod)
+    # Verify reducer v2 epoch lifecycle and access rules (early, so
+    # diagnostics point at user-written code)
+    mod = tilelang.transform.CanonicalizeLegacyReducer()(mod)
+    mod = tilelang.transform.VerifyReducerEpoch()(mod)
+    # Warn on buffers that are read before anything writes them.
+    # Runs after the reducer passes above, so legacy reducers have been
+    # canonicalized, and before PipelinePlanning and LowerTileOp, while
+    # loop bodies are still in source order and tile ops still declare
+    # their access regions.
+    mod = tilelang.transform.VerifyBufferInit()(mod)
 
     # Normalize if-without-else wrappers before pipeline planning. This keeps
     # pipeline body extraction focused on canonical SeqStmt bodies.
     mod = tilelang.transform.IfStmtBinding()(mod)
+
+    # Expand only explicitly requested unroll loops before pipeline planning
+    # and fold the constants exposed by substitution. This makes their
+    # copy/compute statements individual scheduling units.
+    mod = tilelang.transform.UnrollLoop()(mod)
+    # Simplify the unrolled loop bodies.
+    mod = tilelang.transform.Simplify()(mod)
 
     # Run pipeline planning and software-pipeline rewriting before layout
     # inference so inferred layouts see the final pipelined structure directly.
@@ -48,10 +63,16 @@ def MACAPassPipelineBodyPrologue(mod: IRModule, target: Target) -> IRModule:
 
     # Infer memory layouts for fragments and shared memory
     mod = tilelang.transform.LayoutInference()(mod)
+    # Plan physical storage/communication for reducer v2 epochs and
+    # materialize the first-class reducer ops. Loop layouts are frozen at
+    # this point; the planner only reads them.
+    mod = tilelang.transform.ReducerPlanAndMaterialize()(mod)
     # Visualize the layout
     LayoutVisual(mod)
     # Lower high-level tile operations to low-level operations
     mod = tilelang.transform.LowerTileOp()(mod)
+    # Assert no reducer v2 construct survived materialization
+    mod = tilelang.transform.VerifyReducerConsumed()(mod)
 
     # Lower l2 persistent map
     mod = tilelang.cuda.transform.LowerL2Persistent()(mod)
@@ -148,6 +169,4 @@ def MACAPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     return mod
 
 
-maca_pipeline = PassPipeline("maca", MACAPassPipelineBody)
-
-register_pipeline(maca_pipeline)
+MACA_PIPELINE = PassPipeline("maca", MACAPassPipelineBody)

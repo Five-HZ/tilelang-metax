@@ -18,6 +18,8 @@
 
 #include "arith/pattern_match.h"
 #include "backend/common/target_utils.h"
+#include "maca/op/builtin.h"
+#include "maca/target_utils.h"
 #include "op/builtin.h"
 #include "transform/common/attr.h"
 
@@ -2147,7 +2149,7 @@ void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
     os << "for (int i = 0; i < " << num_elem << "; ++i) {\n";
     os << dst << "[" << dst_offset << " + i] = 0.0;";
     os << "}\n";
-  } else if (op->op.same_as(tl::tvm_mfma())) {
+  } else if (op->op.same_as(tl::maca_mma())) {
     // arg 0: prefix: {otype}_{intrM}x{intrN}x{intrK}_{itype}
     // arg 1: A layout: row/col
     // arg 2: B layout: row/col
@@ -2162,7 +2164,7 @@ void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
     // arg 11: C accumulator index
 
     ICHECK(op->args.size() == 12U)
-        << "Invalid number of arguments for tvm_mfma";
+        << "Invalid number of arguments for maca_mma";
     std::string prefix = Downcast<StringImm>(op->args[0])->value;
     std::string A_layout = Downcast<StringImm>(op->args[1])->value;
     std::string B_layout = Downcast<StringImm>(op->args[2])->value;
@@ -3357,6 +3359,47 @@ void CodeGenTileLangMACA::VisitStmt_(const BufferStoreNode *op) {
       EndScope(vec_scope);
     }
   }
+}
+
+void CodeGenTileLangMACA::VisitExpr_(const SelectNode *op, std::ostream &os) {
+  // Non-vector cases.
+  if (!op->condition.dtype().is_fixed_length_vector()) {
+    CodeGenC::VisitExpr_(op, os);
+    return;
+  }
+
+  // Codegen vector condition case by serializing the select op.
+  TVM_FFI_ICHECK(op->false_value->dtype == op->dtype &&
+                 op->true_value->dtype == op->dtype &&
+                 op->dtype.lanes() == op->condition.dtype().lanes());
+
+  std::string r_var = name_supply_->FreshName("_");
+  this->PrintIndent();
+  this->PrintType(op->dtype, stream);
+  stream << ' ' << r_var << ";\n";
+  {
+    std::string c_var =
+        SSAGetID(PrintExpr(op->condition), op->condition.dtype());
+    std::string t_var = SSAGetID(PrintExpr(op->true_value), op->dtype);
+    std::string f_var = SSAGetID(PrintExpr(op->false_value), op->dtype);
+
+    // The condition is stored as an ushort vector.
+    int lanes = op->dtype.lanes();
+    DataType memory_ty(DataType::TypeCode::kUInt, 16, lanes);
+
+    for (int i = 0; i < lanes; ++i) {
+      std::ostringstream item;
+      item << "(bool(";
+      PrintVecElemLoad(c_var, memory_ty, i, item);
+      item << ")?";
+      PrintVecElemLoad(t_var, op->dtype, i, item);
+      item << ':';
+      PrintVecElemLoad(f_var, op->dtype, i, item);
+      item << ')';
+      PrintVecElemStore(r_var, op->dtype, i, item.str());
+    }
+  }
+  os << r_var;
 }
 
 void CodeGenTileLangMACA::VisitExpr_(const ShuffleNode *op,

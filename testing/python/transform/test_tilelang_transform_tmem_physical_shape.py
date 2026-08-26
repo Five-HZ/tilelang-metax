@@ -37,7 +37,9 @@ def _collect_calls(stmt, op_name):
     return calls
 
 
-@tilelang.testing.skip_on_maca
+@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version(10)
+@tilelang.testing.requires_cuda_compute_version_lt(11)
 @pytest.mark.parametrize(
     ("dtype", "expected_num_b32_cols"),
     [(T.float32, 128), (T.bfloat16, 64)],
@@ -65,7 +67,9 @@ def test_tmem_outer_m_tiles_allocate_physical_columns(dtype, expected_num_b32_co
     assert dealloc[0].args[1].value == expected_num_b32_cols
 
 
-@tilelang.testing.skip_on_maca
+@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version(10)
+@tilelang.testing.requires_cuda_compute_version_lt(11)
 @pytest.mark.parametrize("dtype", [T.float16, T.bfloat16, T.float32])
 def test_tmem_frg_type_c_allocates_int32_storage_columns(dtype):
     @T.prim_func

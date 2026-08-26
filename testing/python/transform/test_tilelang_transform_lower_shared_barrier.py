@@ -59,6 +59,7 @@ def _collect_barrier_blocks(stmt):
     return blocks
 
 
+@tilelang.testing.requires_cuda
 def test_single_barrier():
     """Single barrier with one arrive count."""
 
@@ -79,6 +80,7 @@ def test_single_barrier():
     assert init_call.args[1].value == 128
 
 
+@tilelang.testing.requires_cuda
 def test_multiple_barriers():
     """Multiple barriers with different arrive counts."""
 
@@ -105,6 +107,7 @@ def test_multiple_barriers():
     assert len(syncs) >= 1
 
 
+@tilelang.testing.requires_cuda
 def test_no_barrier_is_noop():
     """Pass should be a no-op when no barrier buffers are present."""
 

@@ -17,7 +17,7 @@ struct ScanSumOp {
 
 struct ScanMaxOp {
   template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
-    return max(x, y);
+    return tl::fast_max(x, y);
   }
 
   template <typename T> TL_DEVICE static T identity() {
